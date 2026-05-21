@@ -1,0 +1,33 @@
+# Secrets & credentials
+.env
+.env.*
+**/credentials.json
+**/*.key
+**/.credentials.json
+
+# Claude Code 本機狀態（每台電腦各自產生，不該跨機同步）
+.claude/settings.local.json
+.claude/projects/
+.claude/shell-snapshots/
+.claude/todos/
+.claude/statsig/
+.claude/.credentials.json
+
+# 個人文件（不納入版控）
+.claude/md檔案_自我介紹.docx
+
+# 工作產出資料（業務資料，不納入版控）
+相關資訊_非系統存取用/
+
+# 系統檔
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 大檔 / 暫存
+*.log
+node_modules/
+.venv*/
+__pycache__/
+playwright-images/
+*.pyc

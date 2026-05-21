@@ -1,0 +1,23 @@
+{
+  "skill_name": "pif",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我需要幫一個保濕乳液做 PIF。產品名稱是「水潤保濕乳液」，一般化粧品，劑型是乳液。製造廠是台灣君代生技有限公司，地址是台北市。以下是配方（W/W%）：\n水 (Water) 72.5%\n甘油 (Glycerin) 5.0%\n玻尿酸鈉 (Sodium Hyaluronate) 0.1%\n鯨蠟硬脂醇 (Cetearyl Alcohol) 2.0%\n甘油硬脂酸酯 (Glyceryl Stearate) 1.5%\n礦油 (Mineral Oil) 3.0%\n聚二甲基矽氧烷 (Dimethicone) 1.0%\n尼泊金甲酯 (Methylparaben) 0.15%\n尼泊金丙酯 (Propylparaben) 0.05%\n苯氧乙醇 (Phenoxyethanol) 0.5%\n香精 (Fragrance) 0.2%\nEDTA 二鈉 (Disodium EDTA) 0.05%\n卡波姆 (Carbomer) 0.4%\n三乙醇胺 (Triethanolamine) 適量（調 pH 用）\n請幫我製作 PIF。",
+      "expected_output": "完整的 PIF 文件骨架，包含 16 個章節，成分表已填入配方，適當標示待補項目，並提醒防腐劑 Methylparaben + Propylparaben 的台灣法規限量。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "我有一個防曬乳需要做 PIF，產品叫做「全日防護防曬乳 SPF50 PA+++」，特定用途化粧品，主要成分有二氧化鈦跟氧苯酮，目前還沒有完整配方，能先幫我建立 PIF 框架嗎？",
+      "expected_output": "建立 PIF 文件框架，說明特定用途化粧品的特殊要求，提醒防曬劑法規限量，大部分章節標示待補，附上待辦清單。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "我在做 PIF 的毒理章節，成分裡有苯氧乙醇 (Phenoxyethanol) 0.8%，請幫我整理它的毒理資料，並計算 MoS 值。這是用在臉部留置型保濕乳霜，每次用量約 0.5g，每天用一次。",
+      "expected_output": "提供 Phenoxyethanol 的毒理摘要（NOAEL、刺激性、致敏性），計算 SED 和 MoS 值，判斷是否符合安全標準，並說明台灣法規允許的最高濃度。",
+      "files": []
+    }
+  ]
+}
