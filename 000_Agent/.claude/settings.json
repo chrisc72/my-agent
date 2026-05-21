@@ -6,6 +6,17 @@
     "command": "bash ~/.claude/statusline-command.sh"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"/d/OneDrive/00 Claude Code/000_Agent/scripts/friday-health-check.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
