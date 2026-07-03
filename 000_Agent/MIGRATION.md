@@ -21,6 +21,7 @@
 | `hooks\` | `000_Agent\.claude\hooks\` |
 | `statusline-command.sh` | `000_Agent\.claude\statusline-command.sh` |
 | `skills\` | `000_Agent\skills\` |
+| `projects\D--OneDrive-00-Claude-Code\memory\` | `000_Agent\memory\auto-memory\`（junction，內建 auto-memory 可攜化，2026-07-04） |
 
 ## Codex 雙棲接管（2026-07-04 補做）
 
@@ -70,6 +71,11 @@ New-Item -ItemType Junction -Path "$target\skills" -Target "D:\OneDrive\00 Claud
 # Codex 技能掃描路徑（~/.agents/skills，供 Codex 雙棲用）
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents"
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills" -Target "D:\OneDrive\00 Claude Code\000_Agent\skills"
+
+# 內建 auto-memory 可攜化（換機同步「越用越懂你」的記憶）
+# 注意：只有工作目錄同為 D:\OneDrive\00 Claude Code 時，專案 hash 才會是 D--OneDrive-00-Claude-Code
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\projects\D--OneDrive-00-Claude-Code"
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\projects\D--OneDrive-00-Claude-Code\memory" -Target "D:\OneDrive\00 Claude Code\000_Agent\memory\auto-memory"
 ```
 
 > `AGENTS.md`（Codex 規則檔）是 OneDrive 同步的**真檔**，換機不用重建；只有上面這些 `~/.claude\` 與 `~/.agents\` 的連結需要在每台新電腦重建。

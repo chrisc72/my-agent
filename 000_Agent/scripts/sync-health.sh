@@ -57,6 +57,14 @@ else
   echo "  ❌ MEMORY.md 讀不到：$MEMORY"
   FAIL=$((FAIL+1))
 fi
+# auto-memory 可攜化 junction（內建「越用越懂你」記憶）
+AUTOMEM="$HOME/.claude/projects/D--OneDrive-00-Claude-Code/memory/MEMORY.md"
+if [ -f "$AUTOMEM" ]; then
+  AUTO_COUNT=$(ls "$(dirname "$AUTOMEM")" 2>/dev/null | wc -l)
+  echo "  ✅ auto-memory junction 正常（$AUTO_COUNT 個記憶檔，同步中）"
+else
+  echo "  ⚠️  auto-memory junction 讀不到（換機後需重建，見 MIGRATION.md 情境 2）"
+fi
 
 # 檢查 4：OneDrive 母體資料夾存在
 echo ""
