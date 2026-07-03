@@ -8,7 +8,7 @@
 |------|------|
 | 母體資料夾 | `D:\OneDrive\00 Claude Code\000_Agent\` |
 | 同步管道 | OneDrive（多台 Windows 電腦） |
-| GitHub repo | 見下方「推上 GitHub」步驟（尚待完成） |
+| GitHub repo | https://github.com/chrisc72/my-agent |
 | 體檢腳本 | `000_Agent\scripts\sync-health.sh` |
 | 檢查頻率 | 每週一次（建議週五複盤日） |
 
@@ -22,24 +22,19 @@
 | `statusline-command.sh` | `000_Agent\.claude\statusline-command.sh` |
 | `skills\` | `000_Agent\skills\` |
 
+## Codex 雙棲接管（2026-07-04 補做）
+
+| 項目 | 說明 |
+|------|------|
+| `AGENTS.md`（repo 根） | `CLAUDE.md` 的真檔複製，Codex 讀專案規則。住在 OneDrive 母體內，用真檔非 symlink |
+| `~/.agents/skills` | junction → `000_Agent\skills`，Codex 全域技能掃描（連結在 OneDrive 外，換機需重建） |
+| `~/.codex/config.toml` | 選配，MCP 要用才建 |
+
 ---
 
-## 情境 1：推上 GitHub（尚待完成）
+## 情境 1：GitHub 備份（已完成，remote 已設）
 
-目前 git repo 已在本機初始化，需要手動推上 GitHub：
-
-1. 到 [github.com/new](https://github.com/new) 建立**私有 repo**，名稱建議：`my-agent`
-2. 不要勾選「Add a README file」（已有本機 commit）
-3. 建好後，複製 repo 的 SSH 或 HTTPS URL
-4. 在 Git Bash 執行（把 URL 換成你的）：
-
-```bash
-cd "/d/OneDrive/00 Claude Code"
-git remote add origin https://github.com/你的帳號/my-agent.git
-git push -u origin main
-```
-
-之後每次想備份，執行：
+repo 已推上 https://github.com/chrisc72/my-agent。之後每次想備份，執行：
 ```bash
 cd "/d/OneDrive/00 Claude Code"
 git add -A
@@ -71,7 +66,13 @@ New-Item -ItemType Junction -Path "$target\hooks" -Target "$base\hooks"
 
 # skills Junction（指向 skills 資料夾）
 New-Item -ItemType Junction -Path "$target\skills" -Target "D:\OneDrive\00 Claude Code\000_Agent\skills"
+
+# Codex 技能掃描路徑（~/.agents/skills，供 Codex 雙棲用）
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents"
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills" -Target "D:\OneDrive\00 Claude Code\000_Agent\skills"
 ```
+
+> `AGENTS.md`（Codex 規則檔）是 OneDrive 同步的**真檔**，換機不用重建；只有上面這些 `~/.claude\` 與 `~/.agents\` 的連結需要在每台新電腦重建。
 
 4. 跑體檢腳本確認：
 
@@ -94,13 +95,10 @@ git clone https://github.com/你的帳號/my-agent.git "D:\OneDrive\00 Claude Co
 你的 `CLAUDE.md` 是 AI 無關的規則文件。要給新 AI 讀：
 
 1. 確認新 AI 的規則檔命名（例如 Cursor 讀 `.cursorrules`、Codex 讀 `AGENTS.md`）
-2. 在工作目錄建一個 symlink：
-
-```bash
-ln -s "D:/OneDrive/00 Claude Code/CLAUDE.md" "D:/OneDrive/00 Claude Code/AGENTS.md"
-```
-
-3. skills / memory 邏輯上需要新 AI 支援同等機制才能復用（格式可能需要調整）
+2. **Codex 已接管完成**：`AGENTS.md` 就在 repo 根目錄，內容是 `CLAUDE.md` 的複製（住在 OneDrive 母體內，用真檔不用 symlink，否則 OneDrive 會把連結吃掉）。改規則時兩邊都要更新，`sync-health.sh` 的 [5/6] 會偵測漂移並提醒。
+3. **Codex 技能**：`~/.agents/skills` junction 指向 `000_Agent\skills`（見情境 2 的重建指令），Codex 全域可讀。
+4. **Codex MCP（選配）**：Claude 的 JSON 設定要改寫成 `~/.codex/config.toml` 的 `[mcp_servers.xxx]` 格式才能用。
+5. 其他新 AI（Gemini `GEMINI.md`、Cursor `.cursorrules` 等）：同樣把 `CLAUDE.md` 複製成對應檔名即可。
 
 ---
 

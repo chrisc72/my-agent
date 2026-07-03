@@ -14,7 +14,7 @@ CLAUDE_DIR="$USERPROFILE/.claude"
 CLAUDE_DIR_BASH="$HOME/.claude"
 
 # 檢查 1：~/.claude/ 底下的 symlink 指向是否都存在
-echo "[1/4] 檢查 ~/.claude/ symlink..."
+echo "[1/6] 檢查 ~/.claude/ symlink..."
 for item in settings.json CLAUDE.md hooks statusline-command.sh skills; do
   link="$CLAUDE_DIR_BASH/$item"
   if [ -L "$link" ]; then
@@ -35,7 +35,7 @@ done
 
 # 檢查 2：關鍵 skill 讀得到
 echo ""
-echo "[2/4] 檢查關鍵 skill 可讀取..."
+echo "[2/6] 檢查關鍵 skill 可讀取..."
 for skill in skill-creator pif; do
   TEST_SKILL="$CLAUDE_DIR_BASH/skills/$skill/SKILL.md"
   if [ -f "$TEST_SKILL" ]; then
@@ -47,7 +47,7 @@ done
 
 # 檢查 3：MEMORY.md 可讀取
 echo ""
-echo "[3/4] 檢查記憶系統..."
+echo "[3/6] 檢查記憶系統..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MEMORY="$SCRIPT_DIR/../memory/MEMORY.md"
 if [ -f "$MEMORY" ]; then
@@ -60,7 +60,7 @@ fi
 
 # 檢查 4：OneDrive 母體資料夾存在
 echo ""
-echo "[4/4] 檢查 OneDrive 母體資料夾..."
+echo "[4/6] 檢查 OneDrive 母體資料夾..."
 MOTHER="/d/OneDrive/00 Claude Code/000_Agent/.claude"
 if [ -d "$MOTHER" ]; then
   FILE_COUNT=$(find "$MOTHER" -type f 2>/dev/null | wc -l)
@@ -68,6 +68,34 @@ if [ -d "$MOTHER" ]; then
 else
   echo "  ❌ 母體 .claude/ 不存在：$MOTHER"
   FAIL=$((FAIL+1))
+fi
+
+# 檢查 5：Codex 規則檔 AGENTS.md（含漂移偵測）
+echo ""
+echo "[5/6] 檢查 Codex 規則檔 AGENTS.md..."
+MOTHER_ROOT="/d/OneDrive/00 Claude Code"
+AGENTS="$MOTHER_ROOT/AGENTS.md"
+CLAUDEMD="$MOTHER_ROOT/CLAUDE.md"
+if [ -f "$AGENTS" ]; then
+  echo "  ✅ AGENTS.md 存在"
+  if [ -f "$CLAUDEMD" ] && [ "$CLAUDEMD" -nt "$AGENTS" ]; then
+    echo "  ⚠️  CLAUDE.md 比 AGENTS.md 新，規則檔可能已漂移，記得同步："
+    echo "     cp \"$CLAUDEMD\" \"$AGENTS\""
+    FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ⚠️  找不到 AGENTS.md（Codex 讀不到核心規則）"
+  FAIL=$((FAIL+1))
+fi
+
+# 檢查 6：Codex 技能掃描路徑
+echo ""
+echo "[6/6] 檢查 Codex skills（~/.agents/skills）..."
+CODEX_SKILL="$HOME/.agents/skills/skill-creator/SKILL.md"
+if [ -f "$CODEX_SKILL" ]; then
+  echo "  ✅ Codex skill-creator 可讀取"
+else
+  echo "  ⚠️  ~/.agents/skills 讀不到（若你只用 Claude 可忽略；換機後需重建 junction）"
 fi
 
 echo ""
