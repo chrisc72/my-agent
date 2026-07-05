@@ -75,6 +75,7 @@ _TOX_SYSTEM = """你是化妝品法規與毒理學專家。
 4. 若提供的是搜尋摘要（非文件全文），請標注「[資料來源為搜尋摘要，建議直接查閱原始報告]」。
 5. 若文件有明確評估年份，請記錄以供時效性判斷。
 6. 若有 EU CosIng 資料，明確標示成分在 EU Cosmetics Regulation 各 Annex 中的狀態：Annex II（禁用）、III（限量使用）、IV（色素）、V（防腐劑）、VI（防曬劑）。查無限制則標明「EU CosIng 查無 Annex 限制，可自由使用，但仍需安全評估佐證」。來源標注「[來源：EU CosIng]」。
+7. NOAEL 常有多個（不同研究、終點、給藥途徑）。請選擇 SCCS/CIR 實際用於計算 MoS 的那一個「關鍵 NOAEL」——通常來自關鍵毒性研究、以 mg/kg bw/day 表示的全身性 NOAEL，切勿取文件中第一個出現的數值。
 
 以繁體中文輸出，格式清晰。"""
 
@@ -212,6 +213,7 @@ CAS Number：{cas_number or '未知'}
 
 **NOAEL / 安全濃度：**
 [從 SCCS/CIR 資料提取，如無則根據訓練知識說明，需標明「基於訓練資料」]
+關鍵NOAEL（用於MoS）：[僅填數值與單位，例：100 mg/kg bw/day；並註明來源關鍵研究或文件。若文獻未提供可用於 MoS 的明確 NOAEL，此行填「無」]
 
 **SCCS 評估結論：**
 [如有 SCCS Opinion，必須引用第 4 節（Conclusion）的原文判定；若提供文件未含 Conclusion 章節，請明確說明並標注文件截斷位置]

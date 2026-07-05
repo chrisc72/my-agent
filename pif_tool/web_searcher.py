@@ -3,6 +3,7 @@ import re
 import time
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 
 HEADERS = {
     "User-Agent": (
@@ -12,22 +13,71 @@ HEADERS = {
     )
 }
 TIMEOUT = 15
-PDF_TIMEOUT = 30
+PDF_TIMEOUT = 20
 PDF_MAX_SIZE = 5_242_880   # 5 MB
 PDF_MAX_CHARS = 15_000
+PER_SOURCE_BUDGET = 22.0   # 單一來源(SCCS/CIR/CosIng)的最長查詢秒數，避免慢主機拖垮整體
 
-_TOX_KEYWORDS = [
-    "noael", "loael", "mos", "margin of safety", "conclusion",
-    "safe", "concentration", "exposure", "toxicolog",
-    "dermal", "systemic", "sensitiz", "acceptable", "final report",
+
+def _expired(deadline: float | None) -> bool:
+    """是否已超過時間預算。"""
+    return deadline is not None and time.monotonic() > deadline
+
+# 含關鍵毒理數值的頁面關鍵字（找不到結論章節時的備援排序依據）
+_NUMERIC_KEYWORDS = [
+    "noael", "loael", "margin of safety", "systemic exposure",
+    " mos ", "mos=", "mos ", "sed ",
+]
+
+# 結論章節標題（SCCS 意見書、CIR 報告）— 行首錨定，允許章節編號前綴
+_CONCLUSION_HEADINGS = [
+    r"(?im)^\s*(?:[\d.]+\s*)?conclusion of the sccs",
+    r"(?im)^\s*(?:[\d.]+\s*)?overall\s+conclusion",
+    r"(?im)^\s*(?:[\d.]+\s*)?opinion of the sccs",
+    r"(?im)^\s*(?:[\d.]+\s*)?conclusions?\b",
+    r"(?im)^\s*(?:[\d.]+\s*)?discussion\b",
+]
+
+# 結論之後的章節標題（作為結論段落的結束界線）
+_POST_CONCLUSION_HEADINGS = [
+    r"(?im)^\s*(?:[\d.]+\s*)?minority\s+opinion",
+    r"(?im)^\s*(?:[\d.]+\s*)?references\b",
+    r"(?im)^\s*(?:[\d.]+\s*)?bibliography\b",
+    r"(?im)^\s*(?:[\d.]+\s*)?list of abbreviations",
+    r"(?im)^\s*(?:[\d.]+\s*)?annex(?:es)?\b",
 ]
 
 
 # ── PDF 工具函式 ────────────────────────────────────────────────────────────
 
 
+def _find_conclusion_span(text: str) -> tuple[int, int] | None:
+    """定位 SCCS/CIR 的結論章節，回傳 (起始, 結束) 字元位置；找不到回傳 None。"""
+    low = text.lower()
+    n = len(low)
+    start = None
+    for pat in _CONCLUSION_HEADINGS:
+        # 只採用文件 25% 之後的匹配，避開目錄與前言中的提及；取最後一個
+        hits = [m.start() for m in re.finditer(pat, low) if m.start() > n * 0.25]
+        if hits:
+            start = hits[-1]
+            break
+    if start is None:
+        return None
+    end = n
+    for pat in _POST_CONCLUSION_HEADINGS:
+        m = re.search(pat, low[start + 20:])
+        if m:
+            end = min(end, start + 20 + m.start())
+    return start, end
+
+
 def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_chars: int = PDF_MAX_CHARS) -> str:
-    """用 PyMuPDF 從 bytes 抽取 PDF 文字，優先回傳含毒理關鍵詞的頁面。"""
+    """用 PyMuPDF 從 bytes 抽取 PDF 文字。
+
+    超過字數上限時，優先完整保留 Conclusion 章節（SCCS/CIR 判定的核心），
+    再往前補入含 NOAEL / MoS 的評估內文與文件開頭，避免結論落入被省略的中段。
+    """
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -37,20 +87,37 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_chars: int = PDF_MAX_CHARS
         if len(full_text) <= max_chars:
             return full_text
 
-        key_pages = [
+        # 優先策略：鎖定結論章節並完整保留
+        span = _find_conclusion_span(full_text)
+        if span:
+            c_start, c_end = span
+            concl = full_text[c_start:c_end].strip()[:7000]
+
+            remaining = max_chars - len(concl) - 200  # 預留標題與分隔字元
+            pre_budget = max(0, int(remaining * 0.6))
+            pre = full_text[max(0, c_start - pre_budget):c_start].strip()
+            front_budget = max(0, remaining - len(pre))
+            front = full_text[:front_budget].strip()
+
+            parts = ["【評估結論（Conclusion 章節，優先擷取）】\n" + concl]
+            if pre:
+                parts.append("【安全評估內文（含 NOAEL / MoS）】\n" + pre)
+            if front:
+                parts.append("【文件開頭（成分辨識與委任事項）】\n" + front)
+            return "\n\n".join(parts)[:max_chars]
+
+        # 備援一：找不到結論章節時，優先保留含 NOAEL / MoS 的頁面（多在後段）
+        num_pages = [
             p for p in all_pages
-            if any(kw in p.lower() for kw in _TOX_KEYWORDS)
+            if any(kw in p.lower() for kw in _NUMERIC_KEYWORDS)
         ]
-        if key_pages:
-            candidate = "\n---\n".join(key_pages)
+        if num_pages:
+            candidate = "\n---\n".join(num_pages)
             if len(candidate) <= max_chars:
                 return candidate
-            # 結論在後段：前 1/4 背景 + 後 3/4（含 Conclusion 章節）
-            front = max_chars // 4
-            rear = max_chars - front
-            return candidate[:front] + "\n...[中段省略]...\n" + candidate[-rear:]
+            return candidate[-max_chars:]
 
-        # 前 1/3 + 後 2/3（結論通常在後段）
+        # 備援二：前 1/3 + 後 2/3（結論通常在後段）
         front = max_chars // 3
         rear = max_chars - front
         return full_text[:front] + "\n...[中段省略]...\n" + full_text[-rear:]
@@ -214,10 +281,13 @@ def search_cir_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[s
 
     pdf_urls: list[str] = []
     journal_urls: list[str] = []
+    deadline = time.monotonic() + PER_SOURCE_BUDGET
 
     try:
         from ddgs import DDGS
         for query in queries:
+            if _expired(deadline):
+                break
             try:
                 with DDGS() as ddgs:
                     results = list(ddgs.text(query, max_results=6, region="wt-wt"))
@@ -236,6 +306,8 @@ def search_cir_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[s
 
         # 優先：cir-safety.org PDF
         for pdf_url in pdf_urls[:3]:
+            if _expired(deadline):
+                break
             time.sleep(1)
             pdf_bytes = download_pdf_if_small(pdf_url)
             if pdf_bytes:
@@ -245,6 +317,8 @@ def search_cir_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[s
 
         # 備援：學術期刊 DOI → Unpaywall OA PDF → PubMed 摘要
         for journal_url in journal_urls[:2]:
+            if _expired(deadline):
+                break
             doi = _extract_doi(journal_url)
             if not doi:
                 continue
@@ -262,11 +336,12 @@ def search_cir_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[s
                 return tagged, [pmid_url or journal_url]
 
         # 最終備援：DDG 未找到期刊 URL 時，直接用成分名稱搜 PubMed（不需 DOI）
-        time.sleep(1)
-        abstract, pmid_url = _search_pubmed_by_name(inci_name)
-        if len(abstract.strip()) > 100:
-            tagged = f"[來源：PubMed 摘要，非報告全文，建議查閱原始報告]\n{abstract}"
-            return tagged, [pmid_url]
+        if not _expired(deadline):
+            time.sleep(1)
+            abstract, pmid_url = _search_pubmed_by_name(inci_name)
+            if len(abstract.strip()) > 100:
+                tagged = f"[來源：PubMed 摘要，非報告全文，建議查閱原始報告]\n{abstract}"
+                return tagged, [pmid_url]
     except Exception:
         pass
 
@@ -284,10 +359,13 @@ def search_sccs_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[
 
     pdf_urls: list[str] = []
     page_urls: list[str] = []
+    deadline = time.monotonic() + PER_SOURCE_BUDGET
 
     try:
         from ddgs import DDGS
         for query in queries:
+            if _expired(deadline):
+                break
             try:
                 with DDGS() as ddgs:
                     results = list(ddgs.text(query, max_results=6, region="wt-wt"))
@@ -305,6 +383,8 @@ def search_sccs_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[
                 continue
 
         for pdf_url in pdf_urls[:3]:
+            if _expired(deadline):
+                break
             time.sleep(1)
             pdf_bytes = download_pdf_if_small(pdf_url)
             if pdf_bytes:
@@ -313,6 +393,8 @@ def search_sccs_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[
                     return text, [pdf_url]
 
         for page_url in page_urls[:2]:
+            if _expired(deadline):
+                break
             try:
                 resp = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
                 psoup = BeautifulSoup(resp.text, "html.parser")
@@ -421,95 +503,162 @@ def search_cir(inci_name: str, cas_number: str = "") -> tuple[str, list[str]]:
         return f"CIR 搜尋失敗：{e}", []
 
 
-# ── EU CosIng 搜尋 ──────────────────────────────────────────────────────────
+# ── EU CosIng 搜尋（官方現行 EU Search API）──────────────────────────────────
+
+# 舊 REST API（growth/tools-databases/cosing/ref/api）已改為 Angular SPA，
+# 原路徑現只回傳 HTML。改用該 SPA 前端實際呼叫的 EU Search API（POST）。
+# apiKey 取自 CosIng 網站前端公開設定（assets/env-json-config.json），非私密憑證。
+COSING_SEARCH_URL = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
+COSING_API_KEY = "285a77fd-1257-4271-8507-f0c6b2961203"
+
+_ANNEX_LABELS = {
+    "II": "Annex II（禁用物質）",
+    "III": "Annex III（限用物質）",
+    "IV": "Annex IV（准用色素）",
+    "V": "Annex V（准用防腐劑）",
+    "VI": "Annex VI（准用防曬劑）",
+}
+
+
+def _decode_cosing_restriction(codes: list) -> str:
+    """將 cosmeticRestriction（如 'V/29'、'III/98\r\nV/3'）解碼為可讀的 Annex 標示。"""
+    out = []
+    for raw in codes:
+        for code in re.split(r"\s+", str(raw).strip()):   # 一格可能塞多個、以換行分隔
+            if not code:
+                continue
+            annex, _, ref = code.partition("/")
+            label = _ANNEX_LABELS.get(annex.upper(), f"Annex {annex}")
+            out.append(label + (f" Ref {ref}" if ref else ""))
+    return "；".join(out)
+
+
+def _cosing_first(md: dict, key: str) -> str:
+    v = md.get(key) or []
+    if isinstance(v, list):
+        return str(v[0]) if v else ""
+    return str(v)
+
+
+def _cosing_clean(values) -> list[str]:
+    """濾掉空值與佔位符（<empty>、-），並去重。"""
+    seen: list[str] = []
+    for v in values or []:
+        s = str(v).strip()
+        if s and s.lower() != "<empty>" and s != "-" and s not in seen:
+            seen.append(s)
+    return seen
+
+
+def _cosing_name_variants(md: dict) -> set[str]:
+    """成分所有可比對名稱（含斜線組合名拆解），小寫。"""
+    out: set[str] = set()
+    for key in ("inciName", "nameOfCommonIngredientsGlossary", "chemicalName"):
+        for n in (md.get(key) or []):
+            n = str(n).strip()
+            if not n:
+                continue
+            out.add(n.lower())
+            for part in re.split(r"[/\r\n]", n):
+                if part.strip():
+                    out.add(part.strip().lower())
+    return out
 
 
 def search_cosing_direct(inci_name: str, cas_number: str = "") -> tuple[str, list[str]]:
     """
-    查詢 EU CosIng 資料庫的成分法規狀態。
-    策略：先嘗試 CosIng REST API，失敗則 DDG 搜尋 fallback。
+    查詢 EU CosIng 資料庫的成分法規狀態（Annex、限量、功能）。
+    使用 CosIng 官網前端所用的 EU Search API（POST）。
     回傳 (text, [url])，查無資料回傳 ("", [])。
     """
-    urls_found: list[str] = []
-
-    # Step 1: 嘗試 CosIng REST API
     try:
-        api_url = "https://ec.europa.eu/growth/tools-databases/cosing/ref/api/ingredients"
-        params: dict = {"name": inci_name, "pageNumber": 0, "pageSize": 5}
-        resp = requests.get(api_url, params=params, headers=HEADERS, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            items = data if isinstance(data, list) else data.get("ingredients", data.get("content", []))
-            if items:
-                parts = []
-                for item in items[:3]:
-                    name = item.get("inciName") or item.get("name", "")
-                    functions = item.get("functions", [])
-                    restrictions = item.get("restrictions", [])
-                    status = item.get("status", "")
-                    fn_str = "、".join(
-                        (f.get("name") or f) if isinstance(f, dict) else str(f)
-                        for f in functions
-                    ) if functions else "無"
-                    rest_parts = []
-                    for r in restrictions:
-                        annex = r.get("annexNumber") or r.get("annex", "")
-                        ref = r.get("refNumber") or r.get("reference", "")
-                        limit = r.get("maximumConcentration") or r.get("concentrationLimit", "")
-                        cond = r.get("conditions") or r.get("conditionsOfUse", "")
-                        rest_parts.append(
-                            f"Annex {annex} Ref {ref}"
-                            + (f"，最大濃度 {limit}" if limit else "")
-                            + (f"，條件：{cond}" if cond else "")
-                        )
-                    rest_str = "；".join(rest_parts) if rest_parts else "無 Annex 限制"
-                    parts.append(
-                        f"INCI: {name}\n功能：{fn_str}\n狀態：{status}\nAnnex 限制：{rest_str}"
-                    )
-                text = "【EU CosIng API 資料】\n" + "\n\n".join(parts)
-                urls_found.append(f"{api_url}?name={inci_name}")
-                return text, urls_found
+        # pageSize 取較大值：母體化合物有時排在其衍生物之後（如 Salicylic Acid）
+        resp = requests.post(
+            COSING_SEARCH_URL,
+            params={"apiKey": COSING_API_KEY, "text": inci_name, "pageSize": 30},
+            headers=HEADERS,
+            timeout=TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return "", []
+        results = resp.json().get("results", [])
     except Exception:
-        pass
+        return "", []
 
-    # Step 2: DDG fallback
-    try:
-        from ddgs import DDGS
-        query = f'site:ec.europa.eu "cosing" "{inci_name}"'
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
-        ec_results = [r for r in results if "ec.europa.eu" in r.get("href", "")]
-        if not ec_results and cas_number:
-            query2 = f'EU CosIng cosmetics ingredient "{cas_number}" annex'
-            with DDGS() as ddgs:
-                results2 = list(ddgs.text(query2, max_results=3))
-            ec_results = [r for r in results2 if "ec.europa.eu" in r.get("href", "")]
+    inci_l = inci_name.lower().strip()
+    cas_c = cas_number.strip()
 
-        if ec_results:
-            target_url = ec_results[0]["href"]
-            resp = requests.get(target_url, headers=HEADERS, timeout=TIMEOUT)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
-            text = soup.get_text(separator="\n", strip=True)[:2500]
-            if text:
-                urls_found.append(target_url)
-                return f"【EU CosIng 網頁摘要】\n{text}", urls_found
-        elif results:
-            snippets = "\n".join(
-                f"- {r.get('title','')}: {r.get('body','')}" for r in results[:3]
-            )
-            return f"【EU CosIng 搜尋摘要（非完整資料）】\n{snippets}", []
-    except Exception:
-        pass
+    # 取第一筆名稱或 CAS 精確相符的 CosIng 條目，避免抓到衍生物或化學品庫雜訊
+    md = None
+    for res in results:
+        if res.get("database") != "GROWTH_COSING":
+            continue
+        m = res.get("metadata", {})
+        cas_list = [str(c).strip() for c in (m.get("casNo") or [])]
+        if inci_l in _cosing_name_variants(m) or (cas_c and cas_c in cas_list):
+            md = m
+            break
+    if md is None:
+        return "", []
 
-    return "", []
+    inci = _cosing_first(md, "inciName") or _cosing_first(md, "nameOfCommonIngredientsGlossary")
+    cas = next(iter(_cosing_clean(md.get("casNo"))), "—")
+    fn = "、".join(_cosing_clean(md.get("functionName"))) or "無"
+    status = _cosing_first(md, "status")
+    restr_codes = _cosing_clean(md.get("cosmeticRestriction"))
+    annex_str = _decode_cosing_restriction(restr_codes) if restr_codes else "查無 Annex 限制"
+    maxc = "、".join(_cosing_clean(md.get("maximumConcentration")))
+    cond = "；".join(_cosing_clean(md.get("wordingOfConditions")))
+    other = "；".join(_cosing_clean(md.get("otherRestrictions")))
+
+    block = (f"INCI：{inci}\nCAS：{cas}\n功能：{fn}\n狀態：{status}\n"
+             f"Annex 限制：{annex_str}")
+    if maxc:
+        block += f"\n最大濃度：{maxc}"
+    if cond:
+        block += f"\n使用條件：{cond}"
+    if other:
+        block += f"\n其他限制：{other}"
+
+    text = "【EU CosIng（官方資料庫）】\n" + block
+    url = f"https://ec.europa.eu/growth/tools-databases/cosing/?searchType=simple&text={inci_name}"
+    return text, [url]
 
 
 # ── 備援搜尋：Europe PMC（不依賴 DuckDuckGo）─────────────────────────────────
 
 EUROPEPMC_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+
+# 毒理／化妝品安全訊號字（供 Europe PMC 結果相關性計分）
+_PMC_SAFETY_SIGNALS = [
+    "safety assessment", "toxicolog", "toxicity", "noael",
+    "risk assessment", "cosmetic", "sccs", "cir",
+]
+
+
+def _pmc_relevance_score(title: str, abstract: str, name_tokens: list[str]) -> int:
+    """
+    依標題/摘要計算與「該成分安全評估」的相關性分數。
+    分數越高越像 CIR/SCCS 型評估報告；0 分代表僅順口提及、應淘汰。
+    """
+    tl = title.lower()
+    ab = abstract.lower()
+    name_in_title = all(tok in tl for tok in name_tokens) if name_tokens else False
+    name_in_abstract = all(tok in ab for tok in name_tokens) if name_tokens else False
+    title_has_safety_assess = "safety assessment" in tl
+    title_has_signal = any(s in tl for s in _PMC_SAFETY_SIGNALS)
+    abstract_has_signal = any(s in ab for s in _PMC_SAFETY_SIGNALS)
+
+    if name_in_title and title_has_safety_assess:
+        return 4  # 標題即「Safety Assessment of <成分>」——最典型的 CIR/SCCS 報告
+    if name_in_title and title_has_signal:
+        return 3  # 標題含成分名＋毒理/化妝品訊號
+    if name_in_title and abstract_has_signal:
+        return 2  # 標題點名成分、摘要談安全
+    if name_in_abstract and abstract_has_signal:
+        return 1  # 僅摘要提及成分＋安全訊號（弱相關）
+    return 0      # 僅順口提及成分、無安全脈絡 → 淘汰
 
 
 def search_europepmc(inci_name: str, cas_number: str = "",
@@ -518,13 +667,32 @@ def search_europepmc(inci_name: str, cas_number: str = "",
     不依賴搜尋引擎的備援：查 Europe PMC（EBI 官方 REST API，免金鑰、穩定）。
     CIR 安全評估報告多發表於期刊、被 Europe PMC / PubMed 收錄，故可作為
     DuckDuckGo 全數落空時的毒理文獻來源。回傳 (摘要文字, 來源URL清單)。
+
+    查詢策略：成分名限定 TITLE/ABSTRACT 欄位（論文須「以此成分為主題」而非
+    順口提及），毒理 OR 群組偏向化妝品安全文獻，維持預設相關性排序。抓較多候選
+    後再依標題/摘要計分過濾，只保留與該成分安全評估真正相關者。
     """
-    query = f'{inci_name} AND (toxicology OR "safety assessment" OR SCCS OR CIR OR NOAEL)'
+    name = inci_name.strip()
+    if not name:
+        return "", []
+
+    # 成分名限定標題/摘要欄位；有 CAS 時加為 OR 備選比對
+    name_terms = [f'"{name}"']
+    cas = cas_number.strip()
+    if cas:
+        name_terms.append(f'"{cas}"')
+    name_clause = " OR ".join(
+        f"(TITLE:{t} OR ABSTRACT:{t})" for t in name_terms
+    )
+    safety_clause = ('("safety assessment" OR toxicology OR toxicity OR NOAEL '
+                     'OR "risk assessment" OR cosmetic OR SCCS OR CIR)')
+    query = f"({name_clause}) AND {safety_clause}"
+
     try:
         resp = requests.get(
             EUROPEPMC_URL,
             params={"query": query, "format": "json",
-                    "pageSize": max_results, "resultType": "core"},
+                    "pageSize": 15, "resultType": "core"},  # 多抓候選供過濾；預設相關性排序
             headers=HEADERS,
             timeout=TIMEOUT,
         )
@@ -536,15 +704,21 @@ def search_europepmc(inci_name: str, cas_number: str = "",
     if not results:
         return "", []
 
-    parts: list[str] = []
-    urls: list[str] = []
+    # 以成分名（去標點、小寫）逐字比對，避免離題論文冒充安全資料
+    name_tokens = [w for w in re.split(r"[^a-z0-9]+", name.lower()) if len(w) > 2]
+
+    scored: list[tuple[int, str, list[str]]] = []
     for x in results:
         title = (x.get("title") or "").strip()
+        abstract = re.sub(r"<[^>]+>", "", (x.get("abstractText") or "").strip())
+        score = _pmc_relevance_score(title, abstract, name_tokens)
+        if score <= 0:
+            continue  # 誠實把關：僅順口提及成分者一律淘汰
+
         year = x.get("pubYear", "")
         doi = x.get("doi", "")
         source = x.get("source", "")
         pid = x.get("id", "")
-        abstract = re.sub(r"<[^>]+>", "", (x.get("abstractText") or "").strip())
         if doi:
             url = f"https://doi.org/{doi}"
         elif source and pid:
@@ -554,10 +728,20 @@ def search_europepmc(inci_name: str, cas_number: str = "",
         block = f"[{year}] {title}"
         if abstract:
             block += f"\n摘要：{abstract[:1500]}"
+        block_urls: list[str] = []
         if url:
             block += f"\n來源：{url}"
-            urls.append(url)
-        parts.append(block)
+            block_urls.append(url)
+        scored.append((score, block, block_urls))
+
+    if not scored:
+        return "", []  # 過濾後無足夠相關文獻，寧可留白也不餵離題論文
+
+    # 依相關性分數穩定排序（同分維持 API 原本的相關性順序），取前 N 筆
+    scored.sort(key=lambda s: s[0], reverse=True)
+    top = scored[:max_results]
+    parts = [b for _, b, _ in top]
+    urls = [u for _, _, us in top for u in us]
 
     header = ("【Europe PMC 學術文獻檢索】"
               "（CIR/毒理評估報告多發表於期刊，以下為相關同儕審查文獻，非官方 Opinion 全文）\n")
@@ -604,24 +788,33 @@ def search_toxicology(
         except Exception:
             pass
 
-    # Step 2: 直接從官網下載 PDF
-    sccs_text, sccs_urls = search_sccs_direct(inci_name, cas_number)
-    cir_text, cir_urls = search_cir_direct(inci_name, cas_number)
+    # Step 2-4: SCCS / CIR / CosIng 三個來源彼此獨立，平行查詢以縮短總耗時。
+    # 各來源內部先試官網 PDF 直抓，失敗再退回 DuckDuckGo 摘要。
+    def _sccs_pipeline() -> tuple[str, list[str]]:
+        text, urls = search_sccs_direct(inci_name, cas_number)
+        if not text:
+            text, urls = search_sccs(inci_name, cas_number)
+        return text, urls
 
-    # Step 3: 失敗時 fallback DuckDuckGo 摘要
-    if not sccs_text:
-        sccs_text, sccs_urls = search_sccs(inci_name, cas_number)
-    if not cir_text:
-        cir_text, cir_urls = search_cir(inci_name, cas_number)
+    def _cir_pipeline() -> tuple[str, list[str]]:
+        text, urls = search_cir_direct(inci_name, cas_number)
+        if not text:
+            text, urls = search_cir(inci_name, cas_number)
+        return text, urls
 
-    # Step 3.5: DuckDuckGo 全數落空時，改用 Europe PMC（不依賴搜尋引擎的備援）
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_sccs = ex.submit(_sccs_pipeline)
+        f_cir = ex.submit(_cir_pipeline)
+        f_cosing = ex.submit(search_cosing_direct, inci_name, cas_number)
+        sccs_text, sccs_urls = f_sccs.result()
+        cir_text, cir_urls = f_cir.result()
+        cosing_text, cosing_urls = f_cosing.result()
+
+    # Step 3.5: SCCS/CIR 全數落空時，改用 Europe PMC（不依賴搜尋引擎的備援）
     if not sccs_text and not cir_text:
         pmc_text, pmc_urls = search_europepmc(inci_name, cas_number)
         if pmc_text:
             cir_text, cir_urls = pmc_text, pmc_urls
-
-    # Step 4: 查詢 EU CosIng
-    cosing_text, cosing_urls = search_cosing_direct(inci_name, cas_number)
 
     all_sources = list(dict.fromkeys(sccs_urls + cir_urls + cosing_urls))
 
