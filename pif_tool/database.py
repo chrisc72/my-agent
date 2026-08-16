@@ -5,6 +5,34 @@ from pathlib import Path
 from datetime import datetime
 
 
+def cost_per_kg(unit_price, price_unit, net_weight=None) -> float | None:
+    """把 ERP 的「一般價 + 基本單位」換算成 元/kg。
+
+    ERP 的一般價只有在基本單位是 KG 時才等於元/kg。單位是「件」「箱」之類的
+    若直接當成元/kg 灌進配方成本，會算出離譜的料價，所以無法換算時回傳 None
+    讓呼叫端顯示提示，而不是硬給一個數字。
+    """
+    if unit_price is None:
+        return None
+    try:
+        price = float(unit_price)
+    except (TypeError, ValueError):
+        return None
+
+    unit = str(price_unit or "").strip().upper().replace(" ", "")
+    if unit in ("KG", "KGS", "公斤", "KILOGRAM"):
+        return price
+
+    # 非 KG 單位：有淨重（每單位幾 kg）才能換算
+    try:
+        nw = float(net_weight) if net_weight is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    if nw > 0:
+        return price / nw
+    return None
+
+
 class IngredientDB:
     def __init__(self, db_path: str = "data/ingredients.db"):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +146,13 @@ class IngredientDB:
                 "ALTER TABLE pif_product_ingredients ADD COLUMN bioavailability_override REAL",
                 "ALTER TABLE pif_product_ingredients ADD COLUMN cramer_class TEXT",
                 "ALTER TABLE pif_documents ADD COLUMN current_chapter INTEGER DEFAULT 1",
+                # 原料採購成本（來源：凌越 ERP「原料 編號」總表）
+                "ALTER TABLE raw_materials ADD COLUMN unit_price REAL",
+                "ALTER TABLE raw_materials ADD COLUMN price_unit TEXT DEFAULT ''",
+                "ALTER TABLE raw_materials ADD COLUMN net_weight REAL",
+                "ALTER TABLE raw_materials ADD COLUMN moq REAL",
+                "ALTER TABLE raw_materials ADD COLUMN price_source TEXT DEFAULT ''",
+                "ALTER TABLE raw_materials ADD COLUMN price_updated_at TEXT",
             ]:
                 try:
                     conn.execute(migration)
@@ -160,6 +195,44 @@ class IngredientDB:
                 "UPDATE raw_materials SET ingredient_code=?, product_name=?, supplier=? WHERE id=?",
                 (ingredient_code, product_name, supplier, material_id)
             )
+
+    def update_material_price(self, material_id: int, unit_price, price_unit: str = "",
+                              net_weight=None, moq=None, price_source: str = ""):
+        """更新單筆原料的採購成本資訊。
+
+        unit_price 傳 None 代表「未設定價格」，與 0 元不同——報價時 0 元會被
+        當成免費原料而少算成本，所以兩者不可混用。
+        """
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE raw_materials SET unit_price=?, price_unit=?, net_weight=?, "
+                "moq=?, price_source=?, price_updated_at=? WHERE id=?",
+                (unit_price, price_unit or "", net_weight, moq,
+                 price_source or "", now, material_id)
+            )
+
+    def upsert_price_by_code(self, ingredient_code: str, unit_price, price_unit: str = "",
+                             net_weight=None, moq=None, supplier: str = "",
+                             price_source: str = "") -> bool:
+        """依原料編號更新價格，回傳是否命中。供 ERP 匯入腳本使用。
+
+        supplier 只在現值為空時寫入，不覆蓋人工填過的內容。
+        """
+        code = (ingredient_code or "").strip()
+        if not code:
+            return False
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "UPDATE raw_materials SET unit_price=?, price_unit=?, net_weight=?, "
+                "moq=?, price_source=?, price_updated_at=?, "
+                "supplier=CASE WHEN IFNULL(supplier,'')='' THEN ? ELSE supplier END "
+                "WHERE TRIM(ingredient_code)=?",
+                (unit_price, price_unit or "", net_weight, moq,
+                 price_source or "", now, supplier or "", code)
+            )
+            return cur.rowcount > 0
 
     def get_materials_summary(self) -> list[dict]:
         """回傳所有原料，附帶文件數、成分數、毒理成分數。"""

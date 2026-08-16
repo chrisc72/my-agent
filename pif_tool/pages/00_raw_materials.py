@@ -15,7 +15,7 @@ from tw_regulations import TW_REGULATIONS, lookup_tw_regulation, format_tw_resul
 from tw_food_ingredients import (
     lookup_food_ingredient, format_food_result, food_list_rows, food_list_size,
 )
-from database import IngredientDB
+from database import IngredientDB, cost_per_kg
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "ingredients.db")
 REG_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "reg_settings.json")
@@ -342,15 +342,36 @@ with tab_list:
                 new_code = st.text_input("原料編號", placeholder="例：RM-001", key="new_code")
             with ac2:
                 new_name = st.text_input("原料商品名稱 *", placeholder="例：Hyaluronic Acid", key="new_name")
+            ac3, ac4 = st.columns(2)
+            with ac3:
+                new_supplier = st.text_input("供應商", placeholder="例：六和", key="new_supplier")
+            with ac4:
+                new_price = st.text_input(
+                    "原料成本(元/kg)", placeholder="選填，留空 = 未設定", key="new_price"
+                )
             bc1, bc2, _ = st.columns([1, 1, 5])
             with bc1:
                 if st.button("✅ 確認新增", type="primary", key="confirm_add"):
+                    price_val = None
+                    price_err = False
+                    if new_price.strip():
+                        try:
+                            price_val = float(new_price.strip())
+                        except ValueError:
+                            price_err = True
+
                     if not new_name.strip():
                         st.error("請輸入原料商品名稱")
+                    elif price_err:
+                        st.error("原料成本必須是數字")
                     else:
                         new_mid = db.create_material(
-                            new_code.strip(), new_name.strip(), ""
+                            new_code.strip(), new_name.strip(), new_supplier.strip()
                         )
+                        if price_val is not None:
+                            db.update_material_price(
+                                new_mid, price_val, "KG", None, None, "手動輸入"
+                            )
                         st.session_state["selected_mid"] = new_mid
                         st.session_state.pop("select_material", None)
                         st.session_state["show_add"] = False
@@ -431,6 +452,15 @@ with tab_list:
             return "✅ 完整"
 
         df_mat["進度"] = df_mat.apply(_progress, axis=1)
+        # 轉 float dtype，未設定價格才會顯示成空白而不是 "None"
+        df_mat["原料成本(元/kg)"] = pd.to_numeric(
+            df_mat.apply(
+                lambda r: cost_per_kg(r.get("unit_price"), r.get("price_unit"),
+                                      r.get("net_weight")),
+                axis=1,
+            ),
+            errors="coerce",
+        )
 
         search_q = st.text_input("搜尋原料", placeholder="輸入原料名稱、編號或供應商…", key="mat_search")
         if search_q:
@@ -448,6 +478,8 @@ with tab_list:
         display_cols = {
             "ingredient_code": "原料編號",
             "product_name": "原料商品名稱",
+            "原料成本(元/kg)": "原料成本(元/kg)",
+            "supplier": "供應商",
             "進度": "進度",
             "is_compound": "類型",
             "file_count": "文件",
@@ -462,6 +494,12 @@ with tab_list:
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
+            column_config={
+                "原料成本(元/kg)": st.column_config.NumberColumn(
+                    "原料成本(元/kg)", format="%.2f",
+                    help="來自凌越 ERP 的一般價。空白代表尚未設定價格（不等於 0 元）",
+                ),
+            },
         )
 
         # 從表格點選更新 selected_mid
@@ -488,9 +526,14 @@ with tab_list:
             code_label = mat.get("ingredient_code") or "（無編號）"
             st.subheader(f"📦 {code_label}　｜　{mat['product_name']}")
 
+            _cpk = cost_per_kg(mat.get("unit_price"), mat.get("price_unit"),
+                               mat.get("net_weight"))
+            _cost_label = f"{_cpk:,.2f} 元/kg" if _cpk is not None else "未設定"
+            st.caption(f"💰 原料成本：{_cost_label}　｜　供應商：{mat.get('supplier') or '—'}")
+
             # ── 編輯基本資訊 ──────────────────────────────────────────────────
             with st.expander("✏️ 編輯基本資訊"):
-                ec1, ec2 = st.columns(2)
+                ec1, ec2, ec3 = st.columns([1, 2, 1])
                 with ec1:
                     edit_code = st.text_input(
                         "原料編號", value=mat.get("ingredient_code") or "", key=f"ec_{mid}"
@@ -499,12 +542,72 @@ with tab_list:
                     edit_name = st.text_input(
                         "原料商品名稱", value=mat.get("product_name") or "", key=f"en_{mid}"
                     )
-                if st.button("💾 儲存基本資訊", key=f"save_info_{mid}"):
-                    db.update_material_info(
-                        mid, edit_code.strip(), edit_name.strip(), ""
+                with ec3:
+                    edit_supplier = st.text_input(
+                        "供應商", value=mat.get("supplier") or "", key=f"es_{mid}"
                     )
-                    st.success("已更新")
-                    st.rerun()
+
+                pc1, pc2, pc3, pc4 = st.columns(4)
+                with pc1:
+                    # 用 text_input 而非 number_input：number_input 沒有「空值」，
+                    # 留空才能表達「未設定價格」，跟 0 元區分開來
+                    edit_price = st.text_input(
+                        "原料成本(元/kg)",
+                        value="" if mat.get("unit_price") is None else str(mat["unit_price"]),
+                        placeholder="留空 = 未設定",
+                        key=f"ep_{mid}",
+                    )
+                with pc2:
+                    edit_unit = st.text_input(
+                        "計價單位", value=mat.get("price_unit") or "KG", key=f"eu_{mid}"
+                    )
+                with pc3:
+                    edit_nw = st.text_input(
+                        "淨重 (kg/單位)",
+                        value="" if mat.get("net_weight") is None else str(mat["net_weight"]),
+                        placeholder="單位非 KG 時才需填",
+                        key=f"enw_{mid}",
+                    )
+                with pc4:
+                    edit_moq = st.text_input(
+                        "最低訂購量",
+                        value="" if mat.get("moq") is None else str(mat["moq"]),
+                        key=f"emoq_{mid}",
+                    )
+
+                if mat.get("price_source"):
+                    _upd = str(mat.get("price_updated_at") or "")[:10]
+                    st.caption(f"價格來源：{mat['price_source']}　（{_upd} 更新）")
+
+                if st.button("💾 儲存基本資訊", key=f"save_info_{mid}"):
+                    def _to_num(s):
+                        s = (s or "").strip()
+                        if not s:
+                            return None
+                        try:
+                            return float(s)
+                        except ValueError:
+                            return "ERR"
+
+                    vals = {k: _to_num(v) for k, v in
+                            (("價格", edit_price), ("淨重", edit_nw), ("最低訂購量", edit_moq))}
+                    bad = [k for k, v in vals.items() if v == "ERR"]
+                    if bad:
+                        st.error(f"以下欄位不是有效數字：{'、'.join(bad)}")
+                    else:
+                        db.update_material_info(
+                            mid, edit_code.strip(), edit_name.strip(), edit_supplier.strip()
+                        )
+                        # 人工改過價格就把來源標成手動，避免誤以為還是 ERP 的數字
+                        src = mat.get("price_source") or ""
+                        if vals["價格"] != mat.get("unit_price"):
+                            src = "手動輸入"
+                        db.update_material_price(
+                            mid, vals["價格"], edit_unit.strip(),
+                            vals["淨重"], vals["最低訂購量"], src,
+                        )
+                        st.success("已更新")
+                        st.rerun()
 
             # ─────────────────────────────────────────────────────────────────
             # 相關文件
