@@ -51,6 +51,7 @@ class IngredientDB:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS pif_documents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_number TEXT DEFAULT '',
                     product_name TEXT NOT NULL,
                     product_type TEXT DEFAULT '',
                     formulation_type TEXT DEFAULT '',
@@ -85,14 +86,59 @@ class IngredientDB:
                     FOREIGN KEY (component_id) REFERENCES components(id)
                 );
             """)
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS regulation_docs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    doc_type TEXT DEFAULT '法規文件',
+                    extracted_text TEXT,
+                    uploaded_at TEXT
+                );
+            """)
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS toxicology_pdf_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    inci_name TEXT NOT NULL UNIQUE,
+                    cas_number TEXT DEFAULT '',
+                    sccs_text TEXT DEFAULT '',
+                    sccs_url TEXT DEFAULT '',
+                    cir_text TEXT DEFAULT '',
+                    cir_url TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+            """)
             for migration in [
                 "ALTER TABLE components ADD COLUMN percentage_range TEXT",
                 "ALTER TABLE raw_materials ADD COLUMN ingredient_code TEXT",
+                "ALTER TABLE material_files ADD COLUMN file_data BLOB",
+                "ALTER TABLE toxicology_pdf_cache ADD COLUMN cosing_text TEXT DEFAULT ''",
+                "ALTER TABLE toxicology_pdf_cache ADD COLUMN cosing_url TEXT DEFAULT ''",
+                "ALTER TABLE components ADD COLUMN ifra_data TEXT",
+                "ALTER TABLE pif_documents ADD COLUMN document_number TEXT DEFAULT ''",
+                "ALTER TABLE pif_product_ingredients ADD COLUMN bioavailability_override REAL",
+                "ALTER TABLE pif_product_ingredients ADD COLUMN cramer_class TEXT",
+                "ALTER TABLE pif_documents ADD COLUMN current_chapter INTEGER DEFAULT 1",
             ]:
                 try:
                     conn.execute(migration)
                 except sqlite3.OperationalError:
                     pass
+
+            # 回填：把文件的 updated_at 補成「該文件章節的最後修改時間」
+            # 修正歷史批次匯入造成的時間戳全部擠在一起、無法正確置頂的問題。
+            # 冪等：執行後不再有比文件更新的章節，重跑不會再變動。
+            conn.execute("""
+                UPDATE pif_documents
+                SET updated_at = (
+                    SELECT MAX(c.updated_at) FROM pif_chapter_data c
+                    WHERE c.pif_id = pif_documents.id
+                )
+                WHERE EXISTS (
+                    SELECT 1 FROM pif_chapter_data c
+                    WHERE c.pif_id = pif_documents.id
+                      AND c.updated_at > pif_documents.updated_at
+                )
+            """)
 
     # ── 原料基本資訊 ────────────────────────────────────
 
@@ -173,7 +219,7 @@ class IngredientDB:
                         material_id,
                         comp.get("inci_name", ""),
                         comp.get("cas_number", ""),
-                        comp.get("percentage"),
+                        (float(p) if (p := comp.get("percentage")) is not None else None),
                         comp.get("percentage_range"),
                         comp.get("tw_regulation", ""),
                         comp.get("sccs_raw", ""),
@@ -183,6 +229,29 @@ class IngredientDB:
                         now,
                     )
                 )
+
+    def save_ifra_data(self, material_id: int, inci_name: str, ifra_json: str) -> None:
+        """儲存（或清除）指定原料成分的 IFRA 用量資料。ifra_json 為空字串表示清除。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE components SET ifra_data=? WHERE material_id=? AND inci_name=?",
+                (ifra_json if ifra_json else None, material_id, inci_name),
+            )
+
+    def get_ifra_data(self, material_id: int, inci_name: str) -> dict | None:
+        """取得指定原料成分的 IFRA 用量資料，未上傳回傳 None。"""
+        import json as _json
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT ifra_data FROM components WHERE material_id=? AND inci_name=?",
+                (material_id, inci_name),
+            ).fetchone()
+        if row and row[0]:
+            try:
+                return _json.loads(row[0])
+            except Exception:
+                return None
+        return None
 
     def search_by_inci(self, keyword: str) -> list[dict]:
         with sqlite3.connect(self.db_path) as conn:
@@ -198,13 +267,14 @@ class IngredientDB:
     # ── 原料文件 ────────────────────────────────────────
 
     def add_material_file(self, material_id: int, filename: str,
-                          file_type: str, extracted_text: str) -> int:
+                          file_type: str, extracted_text: str,
+                          file_data: bytes | None = None) -> int:
         now = datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
-                "INSERT INTO material_files (material_id, filename, file_type, extracted_text, uploaded_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (material_id, filename, file_type, extracted_text, now)
+                "INSERT INTO material_files (material_id, filename, file_type, extracted_text, file_data, uploaded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (material_id, filename, file_type, extracted_text, file_data, now)
             )
             return cur.lastrowid
 
@@ -212,11 +282,18 @@ class IngredientDB:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, filename, file_type, uploaded_at FROM material_files "
-                "WHERE material_id = ? ORDER BY uploaded_at",
+                "SELECT id, filename, file_type, uploaded_at, (file_data IS NOT NULL) AS has_file_data "
+                "FROM material_files WHERE material_id = ? ORDER BY uploaded_at",
                 (material_id,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_material_file_data(self, file_id: int) -> bytes | None:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT file_data FROM material_files WHERE id = ?", (file_id,)
+            ).fetchone()
+            return row[0] if row else None
 
     def get_material_file_texts(self, material_id: int) -> list[dict]:
         """含 extracted_text，供 AI 分析用。"""
@@ -233,24 +310,82 @@ class IngredientDB:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM material_files WHERE id = ?", (file_id,))
 
-    # ── PIF 文件管理 ────────────────────────────────────
+    # ── 法規文件 ────────────────────────────────────────
 
-    def create_pif_document(self, product_name: str) -> int:
+    def add_regulation_doc(self, filename: str, doc_type: str, extracted_text: str) -> int:
         now = datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
-                "INSERT INTO pif_documents (product_name, status, created_at, updated_at) VALUES (?, 'draft', ?, ?)",
-                (product_name, now, now),
+                "INSERT INTO regulation_docs (filename, doc_type, extracted_text, uploaded_at) "
+                "VALUES (?, ?, ?, ?)",
+                (filename, doc_type, extracted_text, now),
+            )
+            return cur.lastrowid
+
+    def get_regulation_docs(self) -> list[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, filename, doc_type, uploaded_at FROM regulation_docs ORDER BY uploaded_at DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_regulation_doc_texts(self) -> list[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, filename, doc_type, extracted_text FROM regulation_docs ORDER BY uploaded_at DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_regulation_doc(self, doc_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM regulation_docs WHERE id = ?", (doc_id,))
+
+    def rename_regulation_doc(self, doc_id: int, new_filename: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE regulation_docs SET filename = ? WHERE id = ?",
+                (new_filename, doc_id),
+            )
+
+    # ── PIF 文件管理 ────────────────────────────────────
+
+    def create_pif_document(self, product_name: str, document_number: str = "") -> int:
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO pif_documents (document_number, product_name, status, created_at, updated_at) VALUES (?, ?, 'draft', ?, ?)",
+                (document_number, product_name, now, now),
             )
             return cur.lastrowid
 
     def get_pif_documents(self) -> list[dict]:
+        import re
+
+        def _nk(s: str) -> list:
+            return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
+
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM pif_documents ORDER BY updated_at DESC"
-            ).fetchall()
-            return [dict(r) for r in rows]
+            rows = conn.execute("SELECT * FROM pif_documents").fetchall()
+            docs = [dict(r) for r in rows]
+
+        if not docs:
+            return docs
+
+        # 最近修改的文件置頂（唯一一筆）
+        most_recent = max(docs, key=lambda d: d.get("updated_at") or "")
+        rest = [d for d in docs if d["id"] != most_recent["id"]]
+
+        # 其餘：有編號依自然順序升序，無編號依名稱升序
+        rest_sorted = sorted(rest, key=lambda d: (
+            0 if d.get("document_number") else 1,
+            _nk(d.get("document_number") or ""),
+            _nk(d.get("product_name") or ""),
+        ))
+
+        return [most_recent] + rest_sorted
 
     def get_pif_document(self, pif_id: int) -> dict | None:
         with sqlite3.connect(self.db_path) as conn:
@@ -265,6 +400,14 @@ class IngredientDB:
         values = list(fields.values()) + [pif_id]
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(f"UPDATE pif_documents SET {set_clause} WHERE id=?", values)
+
+    def set_current_chapter(self, pif_id: int, chapter_number: int):
+        # 只更新目前章節，不動 updated_at，避免每次換章都把文件推到「最近修改」置頂。
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE pif_documents SET current_chapter=? WHERE id=?",
+                (chapter_number, pif_id),
+            )
 
     def delete_pif_document(self, pif_id: int):
         with sqlite3.connect(self.db_path) as conn:
@@ -294,6 +437,10 @@ class IngredientDB:
                    ON CONFLICT(pif_id, chapter_number)
                    DO UPDATE SET content_json=excluded.content_json, updated_at=excluded.updated_at""",
                 (pif_id, chapter_number, content_json, now),
+            )
+            conn.execute(
+                "UPDATE pif_documents SET updated_at=? WHERE id=?",
+                (now, pif_id),
             )
 
     def get_all_pif_completion_counts(self) -> dict[int, int]:
@@ -357,8 +504,9 @@ class IngredientDB:
                 conn.execute(
                     """INSERT INTO pif_product_ingredients
                        (pif_id, sort_order, inci_name, cas_number, percentage, function,
-                        component_id, noael_manual, dap_override)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        component_id, noael_manual, dap_override,
+                        bioavailability_override, cramer_class)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         pif_id, i,
                         ing.get("inci_name", ""),
@@ -368,8 +516,14 @@ class IngredientDB:
                         ing.get("component_id"),
                         ing.get("noael_manual"),
                         ing.get("dap_override"),
+                        ing.get("bioavailability_override"),
+                        ing.get("cramer_class"),
                     ),
                 )
+
+    def clear_pif_chapter3(self, pif_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM pif_product_ingredients WHERE pif_id=?", (pif_id,))
 
     def get_component_by_id(self, component_id: int) -> dict | None:
         with sqlite3.connect(self.db_path) as conn:
@@ -377,25 +531,55 @@ class IngredientDB:
             row = conn.execute("SELECT * FROM components WHERE id=?", (component_id,)).fetchone()
             return dict(row) if row else None
 
-    def lookup_component_by_inci_cas(self, inci_name: str, cas_number: str = "") -> dict | None:
+    def lookup_component_by_inci_cas(
+        self, inci_name: str, cas_number: str = "",
+        material_codes: list[str] | None = None,
+    ) -> dict | None:
+        """依 INCI 名稱／CAS 比對成分。
+
+        material_codes 有值時，先把比對範圍限縮在「parent 原料的 ingredient_code
+        落在 material_codes 內」的成分（避免同 INCI 名稱跨原料抓錯，例如多支香精
+        的 INCI 都叫 Fragrance）；範圍內找不到才 fallback 回全域查詢。
+        """
+        codes = [str(c).strip() for c in (material_codes or []) if str(c).strip()]
+
+        def _query(conn, scoped: bool):
+            inci = inci_name.strip() if isinstance(inci_name, str) else ""
+            cas = cas_number.strip() if isinstance(cas_number, str) else ""
+            if scoped:
+                placeholders = ",".join("?" * len(codes))
+                base = (
+                    "SELECT c.* FROM components c "
+                    "JOIN raw_materials rm ON rm.id = c.material_id "
+                    f"WHERE rm.ingredient_code IN ({placeholders}) AND "
+                )
+                scope_params = tuple(codes)
+            else:
+                base = "SELECT * FROM components WHERE "
+                scope_params = ()
+            row = None
+            if inci:
+                row = conn.execute(
+                    base + "LOWER(inci_name)=LOWER(?) LIMIT 1",
+                    scope_params + (inci,),
+                ).fetchone()
+            if not row and cas:
+                row = conn.execute(
+                    base + "cas_number=? LIMIT 1",
+                    scope_params + (cas,),
+                ).fetchone()
+            if not row and inci:
+                row = conn.execute(
+                    base + "LOWER(inci_name) LIKE LOWER(?) LIMIT 1",
+                    scope_params + (f"%{inci}%",),
+                ).fetchone()
+            return row
+
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = None
-            if inci_name and inci_name.strip():
-                row = conn.execute(
-                    "SELECT * FROM components WHERE LOWER(inci_name)=LOWER(?) LIMIT 1",
-                    (inci_name.strip(),),
-                ).fetchone()
-            if not row and cas_number and cas_number.strip():
-                row = conn.execute(
-                    "SELECT * FROM components WHERE cas_number=? LIMIT 1",
-                    (cas_number.strip(),),
-                ).fetchone()
-            if not row and inci_name and inci_name.strip():
-                row = conn.execute(
-                    "SELECT * FROM components WHERE LOWER(inci_name) LIKE LOWER(?) LIMIT 1",
-                    (f"%{inci_name.strip()}%",),
-                ).fetchone()
+            row = _query(conn, scoped=True) if codes else None
+            if not row:
+                row = _query(conn, scoped=False)
             return dict(row) if row else None
 
     def get_single_material_component_by_inci(
@@ -420,22 +604,22 @@ class IngredientDB:
                 "AND {condition} " + order_clause
             )
             row = None
-            if inci_name and inci_name.strip():
+            if isinstance(inci_name, str) and inci_name.strip():
                 row = conn.execute(
                     single_sql.format(condition="LOWER(c.inci_name) = LOWER(?)"),
                     (inci_name.strip(),),
                 ).fetchone()
-            if not row and cas_number and cas_number.strip():
+            if not row and isinstance(cas_number, str) and cas_number.strip():
                 row = conn.execute(
                     single_sql.format(condition="c.cas_number = ?"),
                     (cas_number.strip(),),
                 ).fetchone()
-            if not row and inci_name and inci_name.strip():
+            if not row and isinstance(inci_name, str) and inci_name.strip():
                 row = conn.execute(
                     any_sql.format(condition="LOWER(c.inci_name) = LOWER(?)"),
                     (inci_name.strip(),),
                 ).fetchone()
-            if not row and cas_number and cas_number.strip():
+            if not row and isinstance(cas_number, str) and cas_number.strip():
                 row = conn.execute(
                     any_sql.format(condition="c.cas_number = ?"),
                     (cas_number.strip(),),
@@ -458,4 +642,107 @@ class IngredientDB:
                 "SELECT * FROM components WHERE material_id=?",
                 (material_id,),
             ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ── PIF 附錄：COA / SDS 匯出用 ──────────────────────────
+
+    def get_pif_material_coa_sds(self, pif_id: int) -> list[dict]:
+        """取得某 PIF 所有原料的 COA/SDS/IFRA 文件（含 file_data）。
+        每個原料可能有多筆（SDS + COA + IFRA 等）；file_data=None 表示尚未補傳。
+        檔名含 IFRA 者即使被標成「其他」也會納入（回溯相容既有資料）。
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT DISTINCT
+                    rm.id          AS material_id,
+                    rm.ingredient_code,
+                    rm.product_name AS material_name,
+                    mf.id          AS file_id,
+                    mf.filename,
+                    mf.file_type,
+                    mf.file_data
+                FROM pif_product_ingredients ppi
+                JOIN components c  ON c.id  = ppi.component_id
+                JOIN raw_materials rm ON rm.id = c.material_id
+                LEFT JOIN material_files mf
+                    ON mf.material_id = rm.id
+                    AND (mf.file_type IN ('COA', 'SDS', 'IFRA')
+                         OR UPPER(mf.filename) LIKE '%IFRA%')
+                WHERE ppi.pif_id = ?
+                ORDER BY rm.ingredient_code, mf.file_type
+            """, (pif_id,)).fetchall()
+            return [dict(r) for r in rows]
+
+    # ── 毒理 PDF 快取 ────────────────────────────────────
+
+    _CACHE_TTL_DAYS = 365
+
+    def get_tox_pdf_cache(self, inci_name: str) -> dict | None:
+        """取得 PDF 快取，TTL 365 天內有效。"""
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=self._CACHE_TTL_DAYS)).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM toxicology_pdf_cache "
+                "WHERE LOWER(inci_name) = LOWER(?) AND created_at > ?",
+                (inci_name.strip(), cutoff),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def save_tox_pdf_cache(
+        self, inci_name: str, cas_number: str,
+        sccs_text: str, sccs_url: str,
+        cir_text: str, cir_url: str,
+        cosing_text: str = "", cosing_url: str = "",
+    ):
+        """寫入或更新 PDF 快取（UPSERT by inci_name）。"""
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT INTO toxicology_pdf_cache
+                   (inci_name, cas_number, sccs_text, sccs_url, cir_text, cir_url,
+                    cosing_text, cosing_url, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(inci_name) DO UPDATE SET
+                       cas_number=excluded.cas_number,
+                       sccs_text=excluded.sccs_text,
+                       sccs_url=excluded.sccs_url,
+                       cir_text=excluded.cir_text,
+                       cir_url=excluded.cir_url,
+                       cosing_text=excluded.cosing_text,
+                       cosing_url=excluded.cosing_url,
+                       created_at=excluded.created_at""",
+                (inci_name.strip(), cas_number or "",
+                 sccs_text, sccs_url or "",
+                 cir_text, cir_url or "",
+                 cosing_text or "", cosing_url or "", now),
+            )
+
+    def delete_tox_pdf_cache(self, inci_name: str):
+        """刪除指定 INCI 名稱的快取，讓下次搜尋重新取得最新資料。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM toxicology_pdf_cache WHERE LOWER(inci_name) = LOWER(?)",
+                (inci_name.strip(),),
+            )
+
+    def get_pif_material_inci_map(self, pif_id: int) -> list[dict]:
+        """取得某 PIF 的 INCI→原料 對應關係，供附錄索引頁使用。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT
+                    ppi.inci_name,
+                    ppi.percentage,
+                    rm.id AS material_id,
+                    rm.ingredient_code,
+                    rm.product_name AS material_name
+                FROM pif_product_ingredients ppi
+                JOIN components c  ON c.id  = ppi.component_id
+                JOIN raw_materials rm ON rm.id = c.material_id
+                WHERE ppi.pif_id = ?
+                ORDER BY rm.ingredient_code, ppi.sort_order
+            """, (pif_id,)).fetchall()
             return [dict(r) for r in rows]

@@ -1,5 +1,6 @@
 """PIF 文件製作頁面 — 16 章節填寫、SED/MoS 計算、Word/PDF 匯出"""
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -10,7 +11,9 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from database import IngredientDB
+from pif_exporter import ATTACHMENT_CHAPTERS, chapter_files
 from tw_regulations import lookup_tw_regulation
+from tw_food_ingredients import lookup_food_ingredient
 
 
 def _claude_create(**kwargs):
@@ -52,20 +55,165 @@ CHAPTER_HINTS = {
     1: "包含產品中英文名稱、類別（一般/特定用途化粧品）、劑型、主要功能宣稱、製造廠名稱地址、公司統編等。",
     2: "填入衛福部食藥署化粧品產品登錄系統的確認文件編號與登錄日期，並可附上截圖或確認信。",
     3: "（本章由上方表格管理）",
-    4: "核對外包裝/容器/標籤/仿單是否齊全，並確認符合第7條標示規定（品名、廠商地址、全成分、內容量、保存期限等）。",
-    5: "提供 GMP 證書號碼與有效期限，或填寫自我聲明書。尚未取得證書者可使用業者自我聲明。",
-    6: "描述製造流程概述，如原料投入順序、溫度控制、混合時間、充填條件等。建議附上批次生產標準書（SOP）。",
+    4: "核對外包裝/容器/標籤/仿單是否齊全，並確認符合第7條標示規定（品名、廠商地址、全成分、內容量、保存期限等）。可於下方上傳標籤/包裝圖檔，匯出時會併入本章節。",
+    5: "提供 GMP 證書號碼與有效期限，或填寫自我聲明書。尚未取得證書者可使用業者自我聲明。可於下方上傳證書 PDF 或圖片，匯出時會併入本章節。",
+    6: "描述製造流程概述，如原料投入順序、溫度控制、混合時間、充填條件等。建議附上批次生產標準書（SOP）。可於下方上傳流程圖或 SOP，匯出時會併入本章節。",
     7: "說明使用部位、建議用量、使用頻率、駐留時間（留置型/沖洗型）、適用族群（成人/嬰幼兒）及不適用族群與警語。",
     8: "建立不良反應管理機制，上市前可填「尚無不良反應紀錄」。嚴重不良反應需於 15 日內向食藥署通報。",
     9: "提供成品的外觀、顏色、氣味、pH、黏度、比重等規格，以及主要活性成分的物化特性（分子量、溶解度等）。",
     10: "（本章由下方 SED/MoS 計算器自動產生）",
-    11: "提供加速試驗（40°C/75%RH，6個月）與長期試驗（25°C/60%RH，12個月）的穩定性結果。如免除需由安全評估人員說明理由。",
-    12: "提供總生菌數、大腸桿菌、金黃色葡萄球菌、綠膿桿菌、黴菌及酵母菌的檢驗報告。眼部/嬰幼兒產品需更嚴格規格。",
-    13: "防腐效能試驗（ISO 11930:2019 或 USP <51>）報告。微生物低風險產品符合特定條件者可豁免。",
-    14: "功能宣稱（如保濕、美白）需有佐證：文獻、體外評估報告、消費者實測報告或成分含量檢驗報告。",
-    15: "列出所有與產品接觸的包裝材質（瓶身、瓶蓋、泵頭等），說明材質、規格、供應商及相容性評估結果。",
+    11: "提供加速試驗（40°C/75%RH，6個月）與長期試驗（25°C/60%RH，12個月）的穩定性結果。如免除需由安全評估人員說明理由。可於下方上傳試驗報告，匯出時會併入本章節。",
+    12: "提供總生菌數、大腸桿菌、金黃色葡萄球菌、綠膿桿菌、黴菌及酵母菌的檢驗報告。眼部/嬰幼兒產品需更嚴格規格。可於下方上傳檢驗報告，匯出時會併入本章節。",
+    13: "防腐效能試驗（ISO 11930:2019 或 USP <51>）報告。微生物低風險產品符合特定條件者可豁免。可於下方上傳試驗報告，匯出時會併入本章節。",
+    14: "功能宣稱（如保濕、美白）需有佐證：文獻、體外評估報告、消費者實測報告或成分含量檢驗報告。可於下方上傳佐證資料，匯出時會併入本章節。",
+    15: "列出所有與產品接觸的包裝材質（瓶身、瓶蓋、泵頭等），說明材質、規格、供應商及相容性評估結果。可於下方上傳材質證明，匯出時會併入本章節。",
     16: "由符合資格的安全資料簽署人員（醫/藥/毒理/化粧品相關科系）完成最終安全評估並簽署。",
 }
+
+UPLOAD_ROOT = Path(__file__).parent.parent / "data" / "pif_uploads"
+
+# content_json 中存放檔案路徑的鍵
+_PATH_KEYS = ("uploaded_file_path", "formula_file_path")
+
+
+def _safe_dir_component(s: str) -> str:
+    """去掉 Windows 檔名非法字元，保留中文與空格，結尾不留點或空白。"""
+    s = re.sub(r'[\\/:*?"<>|]', "_", s or "").strip().rstrip(".")
+    return s or "未命名"
+
+
+def _safe_file_name(s: str) -> str:
+    return re.sub(r"[^\w.\-]", "_", s)
+
+
+def _pif_dir_name(pif_doc: dict) -> str:
+    """{貨品編號}_{品名}，無編號時只用品名。"""
+    name = _safe_dir_component(pif_doc.get("product_name", ""))
+    doc_num = _safe_dir_component(pif_doc["document_number"]) if pif_doc.get("document_number") else ""
+    return f"{doc_num}_{name}" if doc_num else name
+
+
+def pif_upload_dir(db: IngredientDB, pif_doc: dict) -> Path:
+    """該 PIF 的附件目錄。不建立目錄。"""
+    dirname = _pif_dir_name(pif_doc)
+    # 兩份 PIF 算出同名目錄時，讓 id 較大的那份加後綴，結果對每份 PIF 都是穩定的
+    clashes = [
+        d["id"] for d in db.get_pif_documents()
+        if d["id"] != pif_doc["id"] and _pif_dir_name(d) == dirname
+    ]
+    if clashes and min(clashes) < pif_doc["id"]:
+        dirname = f"{dirname}_pif{pif_doc['id']}"
+    return UPLOAD_ROOT / dirname
+
+
+def ensure_pif_upload_dir(db: IngredientDB, pif_doc: dict) -> Path:
+    d = pif_upload_dir(db, pif_doc)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _rewrite_chapter_paths(db: IngredientDB, pif_id: int, old_dir: Path, new_dir: Path) -> int:
+    """把該 PIF 章節資料裡指向 old_dir 的檔案路徑改指 new_dir。回傳更新的章節數。"""
+    changed = 0
+    for ch in range(1, 17):
+        data = db.get_chapter_data(pif_id, ch)
+        if not data:
+            continue
+        touched = False
+
+        def _remap(p: str) -> str:
+            nonlocal touched
+            try:
+                rel = Path(p).relative_to(old_dir)
+            except ValueError:
+                return p
+            touched = True
+            return str(new_dir / rel)
+
+        for key in _PATH_KEYS:
+            if data.get(key):
+                data[key] = _remap(data[key])
+        for f in data.get("files", []):
+            if f.get("path"):
+                f["path"] = _remap(f["path"])
+
+        if touched:
+            db.save_chapter_data(pif_id, ch, data)
+            changed += 1
+    return changed
+
+
+def _delete_pif_with_files(db: IngredientDB, pif_doc: dict):
+    """刪除 PIF 及其附件目錄，避免留下孤兒檔。"""
+    shutil.rmtree(pif_upload_dir(db, pif_doc), ignore_errors=True)
+    # 保險：清掉可能殘留在根目錄的舊平鋪檔
+    if UPLOAD_ROOT.exists():
+        for p in UPLOAD_ROOT.glob(f"pif{pif_doc['id']}_*"):
+            p.unlink(missing_ok=True)
+    db.delete_pif_document(pif_doc["id"])
+
+
+def _save_chapter_files(db: IngredientDB, pif_id: int, chapter_num: int, files: list[dict]):
+    """寫回附件清單。重新讀取避免蓋掉其他欄位，並清除第二章的舊單檔欄位。"""
+    data = db.get_chapter_data(pif_id, chapter_num)
+    if files:
+        data["files"] = files
+    else:
+        data.pop("files", None)  # 留下空清單會讓章節完成度誤判為已完成
+    data.pop("uploaded_file_path", None)
+    data.pop("uploaded_file_name", None)
+    db.save_chapter_data(pif_id, chapter_num, data)
+
+
+def render_chapter_attachments(
+    db: IngredientDB, pif_doc: dict, chapter_num: int,
+    label: str = "上傳附件（PDF 或圖片，可多選）",
+) -> list[dict]:
+    """多檔上傳 + 已上傳清單 + 逐檔刪除。回傳目前的附件清單。"""
+    pif_id = pif_doc["id"]
+    files = chapter_files(db.get_chapter_data(pif_id, chapter_num))
+
+    ver_key = f"ch{chapter_num}_upl_ver_{pif_id}"
+    ver = st.session_state.get(ver_key, 0)
+    uploaded = st.file_uploader(
+        label,
+        type=["pdf", "jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+        key=f"ch{chapter_num}_uploader_{pif_id}_{ver}",
+    )
+
+    if uploaded:
+        existing = {f["name"] for f in files}
+        added = False
+        for uf in uploaded:
+            if uf.name in existing:
+                continue
+            upload_dir = ensure_pif_upload_dir(db, pif_doc)
+            save_path = upload_dir / f"ch{chapter_num:02d}_{_safe_file_name(uf.name)}"
+            save_path.write_bytes(uf.getvalue())
+            files.append({"path": str(save_path), "name": uf.name})
+            existing.add(uf.name)
+            added = True
+        if added:
+            _save_chapter_files(db, pif_id, chapter_num, files)
+
+    if files:
+        st.caption(f"已上傳 {len(files)} 個附件，匯出時會依序嵌入本章節")
+        for i, f in enumerate(files):
+            col_name, col_del = st.columns([6, 1])
+            if Path(f["path"]).exists():
+                col_name.write(f"📎 {f['name']}")
+            else:
+                col_name.write(f"⚠️ {f['name']}（檔案遺失，請重新上傳）")
+            if col_del.button("🗑️", key=f"del_ch{chapter_num}_{pif_id}_{i}", help="刪除此附件"):
+                Path(f["path"]).unlink(missing_ok=True)
+                _save_chapter_files(db, pif_id, chapter_num, [x for j, x in enumerate(files) if j != i])
+                st.session_state[ver_key] = ver + 1
+                st.rerun()
+    else:
+        st.info("尚未上傳附件")
+
+    return files
 
 # SCCS 標準日暴露量表（來源：SCCS Notes of Guidance 12th revision, 2023）
 SCCS_EXPOSURE: dict[str, dict] = {
@@ -89,6 +237,15 @@ SCCS_EXPOSURE: dict[str, dict] = {
     "牙膏（成人）": {"daily_g": 2.75, "retention": 0.05},
     "漱口水": {"daily_g": 21.62, "retention": 0.10},
     "自行輸入暴露量": {"daily_g": 0.0, "retention": 1.0},
+}
+
+# TTC（Threshold of Toxicological Concern）備援值，mg/kg bw/day
+# 來源：KB「SCCS 全身暴露劑量與安全邊際計算方法」；僅在無 NOAEL 時作輔助，不得作為唯一結論依據
+TTC_VALUES: dict[str, float] = {
+    "Class I": 0.0491,
+    "Class II": 0.0029,    # 資料庫支持不足，比照 Class III
+    "Class III": 0.0029,
+    "基因毒性警訊": 0.0000025,
 }
 
 # ─── 工具函式 ──────────────────────────────────────────────────────────────────
@@ -187,17 +344,22 @@ def parse_tw_limit_pct(limit_str: str) -> float | None:
     return min(float(m) for m in matches)
 
 
+def calc_exposure(effective_daily_g: float, concentration_pct: float) -> float:
+    """該成分每日外用暴露量（尚未乘皮膚吸收率）mg/kg bw/day。"""
+    return effective_daily_g * (concentration_pct / 100) * 1000 / 60
+
+
 def calc_sed(effective_daily_g: float, concentration_pct: float, dap_pct: float = 100.0) -> float:
     """計算 SED（全身暴露量）。
     SED (mg/kg bw/day) = 有效日用量(g) × 成分濃度/100 × 皮膚吸收率/100 × 1000 ÷ 60
     """
-    return effective_daily_g * (concentration_pct / 100) * (dap_pct / 100) * 1000 / 60
+    return calc_exposure(effective_daily_g, concentration_pct) * (dap_pct / 100)
 
 
-def calc_mos(noael: float | None, sed: float) -> float | None:
-    if noael is None or sed <= 0:
+def calc_mos(pod: float | None, sed: float, bioavailability_pct: float = 100.0) -> float | None:
+    if pod is None or sed <= 0:
         return None
-    return noael / sed
+    return pod * (bioavailability_pct / 100) / sed
 
 
 def chapter_emoji(has_data: bool) -> str:
@@ -290,21 +452,21 @@ def render_chapter_1(db: IngredientDB, pif_id: int):
 
     # AI 自動填寫提示與按鈕
     ch2 = db.get_chapter_data(pif_id, 2)
-    ch2_file = ch2.get("uploaded_file_path", "")
+    ch2_file = next((f for f in chapter_files(ch2) if Path(f["path"]).exists()), None)
     if data.get("ai_filled"):
         st.success("✅ 本章欄位已由 AI 依第二章登錄文件自動填寫，請確認內容後點選「儲存」。")
-    elif ch2_file and Path(ch2_file).exists():
+    elif ch2_file:
         st.info("💡 第二章已有上傳文件，可點下方按鈕讓 AI 自動提取並填入欄位。")
     else:
         st.info("💡 可先到第二章上傳產品登錄確認文件，AI 將自動提取資訊填寫本章。")
 
-    if ch2_file and Path(ch2_file).exists():
+    if ch2_file:
         if st.button("🤖 AI 自動填寫（讀取第二章文件）", key="ch1_ai_fill"):
             with st.spinner("AI 正在讀取文件，請稍候..."):
                 try:
                     extracted = extract_ch1_from_doc(
-                        Path(ch2_file).read_bytes(),
-                        ch2.get("uploaded_file_name", "document.pdf"),
+                        Path(ch2_file["path"]).read_bytes(),
+                        ch2_file["name"],
                     )
                     if extracted:
                         for k, v in extracted.items():
@@ -401,44 +563,22 @@ def render_chapter_1(db: IngredientDB, pif_id: int):
 
 # ─── 第二章：產品登錄之證明文件 ─────────────────────────────────────────────────
 
-def render_chapter_2(db: IngredientDB, pif_id: int):
+def render_chapter_2(db: IngredientDB, pif_doc: dict):
+    pif_id = pif_doc["id"]
     st.subheader("二、完成產品登錄之證明文件")
     st.caption("上傳衛福部食藥署化粧品產品登錄確認文件，AI 可自動讀取並填寫第一章基本資料。")
 
+    files = render_chapter_attachments(
+        db, pif_doc, 2, label="上傳登錄確認文件（PDF 或圖片，可多選）"
+    )
     data = db.get_chapter_data(pif_id, 2)
-    saved_path = data.get("uploaded_file_path", "")
-    saved_name = data.get("uploaded_file_name", "")
 
-    col_up, col_st = st.columns([2, 1])
-    with col_up:
-        uploaded = st.file_uploader(
-            "上傳登錄確認文件（PDF 或圖片）",
-            type=["pdf", "jpg", "jpeg", "png"],
-            key=f"ch2_uploader_{pif_id}",
-        )
-    with col_st:
-        if saved_name:
-            st.success(f"已上傳：{saved_name}")
-        else:
-            st.info("尚未上傳文件")
-
-    if uploaded is not None:
-        upload_dir = Path("data/pif_uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = re.sub(r"[^\w.\-]", "_", uploaded.name)
-        save_path = upload_dir / f"pif{pif_id}_ch2_{safe_name}"
-        save_path.write_bytes(uploaded.getvalue())
-        data["uploaded_file_path"] = str(save_path)
-        data["uploaded_file_name"] = uploaded.name
-        db.save_chapter_data(pif_id, 2, data)
-        saved_path = str(save_path)
-        saved_name = uploaded.name
-
-    if saved_path and Path(saved_path).exists():
+    primary = next((f for f in files if Path(f["path"]).exists()), None)
+    if primary:
         if st.button("🤖 AI 分析文件並自動填寫第一章", type="primary", key=f"ch2_ai_fill_{pif_id}"):
-            with st.spinner("AI 正在讀取文件，請稍候..."):
+            with st.spinner(f"AI 正在讀取「{primary['name']}」，請稍候..."):
                 try:
-                    extracted = extract_ch1_from_doc(Path(saved_path).read_bytes(), saved_name)
+                    extracted = extract_ch1_from_doc(Path(primary["path"]).read_bytes(), primary["name"])
                     if extracted:
                         ch1 = db.get_chapter_data(pif_id, 1)
                         for k, v in extracted.items():
@@ -457,6 +597,8 @@ def render_chapter_2(db: IngredientDB, pif_id: int):
                         st.warning("AI 未能從文件中提取到資訊，請手動填寫第一章。")
                 except Exception as e:
                     st.error(f"AI 分析失敗：{e}")
+        if len(files) > 1:
+            st.caption(f"AI 只會讀取第一個附件「{primary['name']}」。")
 
     st.divider()
     st.markdown("#### 登錄資訊")
@@ -698,16 +840,17 @@ def extract_formula_from_doc(file_bytes: bytes, filename: str) -> list[dict]:
 
 # ─── 第三章：全成分清單（核心） ────────────────────────────────────────────────
 
-def render_chapter_3(db: IngredientDB, pif_id: int):
+def render_chapter_3(db: IngredientDB, pif_doc: dict):
+    pif_id = pif_doc["id"]
     st.subheader("三、全成分名稱及其各別含量")
 
     # ── 兩種輸入方式：上傳 INCI 成分表 vs 從原料編號展開 ──
     data_ch3 = db.get_chapter_data(pif_id, 3)
-    tab_formula, tab_inci = st.tabs(["🔢 從原料編號展開 INCI", "📄 上傳 INCI 成分表（AI 自動提取）"])
+    tab_formula, tab_inci = st.tabs(["🔢 用原料編號建立（系統展開 INCI）", "📄 已有 INCI 清單，直接匯入"])
 
     # ── Tab A：上傳含 INCI 的配方文件 ──────────────────────────────
     with tab_inci:
-        st.caption("上傳已列出 INCI 成分名稱的配方文件（Word / Excel / PDF），AI 直接讀取 INCI 名稱、CAS 號與含量並填入下方成分表。")
+        st.caption("適用於文件裡「已經列出 INCI 成分名稱」的情況（Word / Excel / PDF），AI 直接讀取 INCI 名稱、CAS 號與含量並填入下方成分表，不需查原料庫、不需展開。")
 
         saved_path = data_ch3.get("uploaded_file_path", "")
         saved_name = data_ch3.get("uploaded_file_name", "")
@@ -726,10 +869,8 @@ def render_chapter_3(db: IngredientDB, pif_id: int):
                 st.info("尚未上傳文件")
 
         if uploaded is not None:
-            upload_dir = Path("data/pif_uploads")
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = re.sub(r"[^\w.\-]", "_", uploaded.name)
-            save_path = upload_dir / f"pif{pif_id}_ch3_{safe_name}"
+            upload_dir = ensure_pif_upload_dir(db, pif_doc)
+            save_path = upload_dir / f"ch03_{_safe_file_name(uploaded.name)}"
             save_path.write_bytes(uploaded.getvalue())
             data_ch3["uploaded_file_path"] = str(save_path)
             data_ch3["uploaded_file_name"] = uploaded.name
@@ -773,6 +914,7 @@ def render_chapter_3(db: IngredientDB, pif_id: int):
     # ── Tab B：從原料編號展開 INCI ──────────────────────────────────
     with tab_formula:
         st.caption("提供每支原料的「原料編號」與「在成品中的使用含量（%）」，系統從原料資料庫查出各原料的 INCI 組成，計算各成分在成品中的實際比例，相同 INCI 自動加總，最後由高至低排序。")
+        st.caption("👇 以下兩種只是「輸入原料編號」的方式，擇一使用即可：上傳檔案自動辨識，或手動逐筆輸入。")
 
         sub_upload, sub_manual = st.tabs(["📄 上傳配方文件（AI 解析原料編號）", "✏️ 手動輸入原料編號"])
 
@@ -812,10 +954,8 @@ def render_chapter_3(db: IngredientDB, pif_id: int):
                             ]
                             st.session_state[formula_key] = pd.DataFrame(_parsed_rows)
 
-                            upload_dir = Path("data/pif_uploads")
-                            upload_dir.mkdir(parents=True, exist_ok=True)
-                            safe_name = re.sub(r"[^\w.\-]", "_", formula_file.name)
-                            formula_save_path = upload_dir / f"pif{pif_id}_ch3_formula_{safe_name}"
+                            upload_dir = ensure_pif_upload_dir(db, pif_doc)
+                            formula_save_path = upload_dir / f"ch03_formula_{_safe_file_name(formula_file.name)}"
                             formula_save_path.write_bytes(formula_file.getvalue())
 
                             data_ch3["formula_file_path"] = str(formula_save_path)
@@ -1097,6 +1237,8 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
             "含量%": ing["percentage"] or 0.0,
             "NOAEL (mg/kg/day)": ing.get("noael_manual") or noael_from_db or None,
             "DAp%": ing.get("dap_override") or 100.0,
+            "Bioavailability%": ing.get("bioavailability_override") or 50.0,
+            "Cramer Class": ing.get("cramer_class") or "",
             "毒理資料": "✅ 資料庫" if comp else "⚠️ 需補充",
         })
 
@@ -1111,6 +1253,11 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
                                                                   help="從文獻或資料庫取得的 NOAEL 值，可手動修改"),
             "DAp%": st.column_config.NumberColumn("DAp%（皮膚吸收率）", min_value=0.0, max_value=100.0, format="%.0f",
                                                    help="預設 100%（保守估算）"),
+            "Bioavailability%": st.column_config.NumberColumn("Bioavailability%（口服吸收率）", min_value=0.0, max_value=100.0, format="%.0f",
+                                                               help="無實測時 SCCS 預設 50%"),
+            "Cramer Class": st.column_config.SelectboxColumn("Cramer 分級（無 NOAEL 時採 TTC）",
+                                                             options=["", "Class I", "Class II", "Class III", "基因毒性警訊", "不需評估"],
+                                                             help="無 NOAEL 時依結構判定 TTC；惰性成分（如水）選「不需評估」"),
             "毒理資料": st.column_config.TextColumn("資料來源", disabled=True),
         },
         key=f"ch10_tox_editor_{pif_id}",
@@ -1123,16 +1270,30 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
             conc = row["含量%"]
             noael = row["NOAEL (mg/kg/day)"]
             dap = row["DAp%"]
+            bioavail = row["Bioavailability%"]
+            cramer = row["Cramer Class"]
 
             # 找到對應的成分記錄（用於 fallback 資料查詢）
             ing_rec = next((i for i in ingredients if i["inci_name"] == inci), None)
             cas = ing_rec.get("cas_number", "") if ing_rec else ""
             comp_rec = db.get_component_by_id(ing_rec["component_id"]) if ing_rec and ing_rec.get("component_id") else None
 
-            # 先計算 SED / MoS（供表格顯示，並作為最後備援的判定依據）
+            # 先計算 Exposure / SED（純物理量，與 NOAEL 無關），再依 PoD 來源算 MoS
             noael_val = float(noael) if pd.notna(noael) and noael else None
-            sed = calc_sed(effective_daily_g, conc, dap) if conc else 0.0
-            mos = calc_mos(noael_val, sed)
+            exposure = calc_exposure(effective_daily_g, conc) if conc else 0.0
+            sed = exposure * (dap / 100)
+
+            if cramer == "不需評估":
+                pod_used, pod_source, mos = None, "不需評估", None
+            elif noael_val:
+                pod_used, pod_source = noael_val, "NOAEL"
+                mos = calc_mos(noael_val, sed, bioavail)
+            elif cramer in TTC_VALUES:
+                pod_used, pod_source = TTC_VALUES[cramer], f"TTC（Cramer {cramer}）"
+                mos = calc_mos(pod_used, sed, 100.0)   # TTC 已是全身可接受劑量，不再乘生體可用率
+            else:
+                pod_used, pod_source, mos = None, None, None
+            rcr = (1 / mos) if mos else None
 
             # 候選一：台灣法規上限（精確比對，避免子字串誤判）
             tw_entries_all = lookup_tw_regulation(inci_name=inci, cas_number=cas)
@@ -1152,6 +1313,9 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
                         safe_conc_tw = pct
                         tw_limit_display = entry["limit"]
 
+            # 候選一之二：食用安全史（WoE）。部位不符者不採計，靜默落回 NOAEL/MoS
+            food_res = lookup_food_ingredient(inci)
+
             # 候選二：文獻建議安全使用濃度（SCCS / CIR / 毒理摘要）
             safe_conc_lit = None
             lit_source = ""
@@ -1168,8 +1332,12 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
                         lit_source = label
                         break
 
-            # 判定優先序：台灣法規上限 → 文獻安全濃度 → NOAEL / MoS
-            if safe_conc_tw is not None:
+            # 判定優先序：不需評估 → 台灣法規上限 → 文獻安全濃度 → 食用安全史 WoE → NOAEL/MoS → TTC 輔助
+            if cramer == "不需評估":
+                basis = "不需評估"
+                conclusion = "惰性成分，不需個別 MoS 評估（As discussion）"
+
+            elif safe_conc_tw is not None:
                 basis = f"台灣法規上限（{tw_limit_display}）"
                 if conc <= safe_conc_tw:
                     conclusion = f"✅ 安全（添加量 {conc:.4f}% ≤ 台灣法規上限 {safe_conc_tw:.4f}%）"
@@ -1183,12 +1351,32 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
                 else:
                     conclusion = f"🔴 添加量 {conc:.4f}% 超出文獻建議 {safe_conc_lit:.4f}%，需評估"
 
-            elif mos is not None:
+            elif food_res["status"] == "food_approved":
+                if food_res["part_unspecified"]:
+                    parts = "、".join(food_res["allowed_parts"])
+                    basis = f"食品原料 WoE（表列部位：{parts}，請確認原料實際使用部位）"
+                else:
+                    basis = "食品原料 WoE"
+                if mos is not None and mos < 100:
+                    conclusion = (
+                        f"⚠️ 列於台灣「可供食品使用原料一覽表」，但 MoS = {mos:.1f} < 100，需人工複核"
+                    )
+                else:
+                    conclusion = (
+                        "✅ 安全（列於台灣「可供食品使用原料一覽表」，具長期歷史食用安全性；"
+                        "外用之皮膚吸收低於經口暴露，安全性可接受）"
+                    )
+
+            elif pod_source == "NOAEL" and mos is not None:
                 basis = "NOAEL / MoS"
                 if mos >= 100:
                     conclusion = f"✅ 安全（MoS = {mos:.1f} ≥ 100）"
                 else:
                     conclusion = f"🔴 MoS = {mos:.1f} < 100，需進一步評估"
+
+            elif pod_source and pod_source.startswith("TTC") and mos is not None:
+                basis = f"TTC（{cramer}，輔助）"
+                conclusion = f"⚠️ 無 NOAEL，採 TTC 估算 MoS = {mos:.1f}（僅供輔助，須人工確認）"
 
             else:
                 basis = "—"
@@ -1200,8 +1388,14 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
                 "評估依據": basis,
                 "NOAEL (mg/kg/day)": f"{noael_val:.2f}" if noael_val else "—",
                 "DAp%": f"{dap:.0f}%",
-                "SED (mg/kg/day)": f"{sed:.6f}" if noael_val else "—",
+                "Exposure (mg/kg bw/day)": f"{exposure:.6f}" if conc else "—",
+                "SED (mg/kg/day)": "—" if cramer == "不需評估" else (f"{sed:.6f}" if conc else "—"),
+                "PoD (mg/kg bw/day)": f"{noael_val:.2f}" if pod_source == "NOAEL" else "—",
+                "ToE value": f"{pod_used:.7f}" if pod_source and pod_source.startswith("TTC") else "—",
+                "Bioavailability%": f"{bioavail:.0f}%",
                 "MoS": f"{mos:.1f}" if mos else "—",
+                "RCR(MoE)": f"{rcr:.4f}" if rcr else "—",
+                "PoD 來源": pod_source or "—",
                 "結論": conclusion,
             })
 
@@ -1209,14 +1403,18 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
         result_df = pd.DataFrame(results)
         st.dataframe(result_df, use_container_width=True, hide_index=True)
 
-        # 儲存 NOAEL 和 DAp 覆寫值到資料庫
+        # 儲存 NOAEL / DAp / Bioavailability / Cramer 覆寫值到資料庫
         updated_ings = db.get_pif_ingredients(pif_id)
         for i, row in edited_tox.iterrows():
             if i < len(updated_ings):
                 noael_val = row["NOAEL (mg/kg/day)"]
                 dap_val = row["DAp%"]
+                bio_val = row["Bioavailability%"]
+                cram_val = row["Cramer Class"]
                 updated_ings[i]["noael_manual"] = float(noael_val) if pd.notna(noael_val) else None
                 updated_ings[i]["dap_override"] = float(dap_val)
+                updated_ings[i]["bioavailability_override"] = float(bio_val) if pd.notna(bio_val) else None
+                updated_ings[i]["cramer_class"] = cram_val or None
         db.save_pif_ingredients(pif_id, updated_ings)
 
         # 儲存計算結果文字到章節資料
@@ -1240,6 +1438,50 @@ def render_chapter_10(db: IngredientDB, pif_id: int):
         st.divider()
         st.caption("上次計算結果（已儲存）：")
         st.dataframe(pd.DataFrame(saved["results"]), use_container_width=True, hide_index=True)
+
+
+# ─── 第十六章：安全性評估匯總表（呈現層，讀第十章結果） ──────────────────────────
+
+def render_chapter_16(db: IngredientDB, pif_id: int):
+    st.subheader("十六、產品安全資料（安全評估報告）")
+    st.markdown("#### 安全性評估匯總表")
+    st.latex(r"MoS = \frac{PoD_{sys}}{SED} = \frac{PoD \times Bioavailability}{Exposure \times Dermal\ Absorption}")
+    st.caption("PoDsys = PoD × 生體可用率；SED = 外用暴露量 × 皮膚吸收率；判定門檻 MoS ≥ 100；TTC 估算僅供輔助。")
+
+    ch10 = db.get_chapter_data(pif_id, 10)
+    if not ch10.get("results"):
+        st.warning("⚠️ 尚未完成第十章 SED/MoS 計算，請先至第十章計算並儲存。")
+    else:
+        rows = [{
+            "成分名稱": r.get("INCI 名稱", ""),
+            "含量 w/w%": r.get("含量%", ""),
+            "Exposure (mg/kg bw/day)": r.get("Exposure (mg/kg bw/day)", "—"),
+            "皮膚吸收%": r.get("DAp%", ""),
+            "SED (mg/kg bw/day)": r.get("SED (mg/kg/day)", "—"),
+            "PoD (mg/kg bw/day)": r.get("PoD (mg/kg bw/day)", "—"),
+            "ToE value": r.get("ToE value", "—"),
+            "Bioavailability%": r.get("Bioavailability%", "—"),
+            "MoS": r.get("MoS", "—"),
+            "RCR(MoE)": r.get("RCR(MoE)", "—"),
+            "MoE Approach": r.get("評估依據", "—"),
+        } for r in ch10["results"]]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### 安全評估結論與簽署")
+    data = db.get_chapter_data(pif_id, 16)
+    default = data.get("content", CHAPTER_TEMPLATES[16])
+    content = st.text_area(
+        "章節內容",
+        value=default,
+        height=350,
+        key="ch16_content",
+        label_visibility="collapsed",
+    )
+    if st.button("💾 儲存第十六章", type="primary", key="save_ch16"):
+        db.save_chapter_data(pif_id, 16, {"content": content})
+        st.success("第 16 章已儲存！")
+        st.rerun()
 
 
 # ─── 通用章節（文字填寫） ───────────────────────────────────────────────────────
@@ -1269,7 +1511,8 @@ NUM_ZH = {
 }
 
 
-def render_generic_chapter(db: IngredientDB, pif_id: int, chapter_num: int):
+def render_generic_chapter(db: IngredientDB, pif_doc: dict, chapter_num: int):
+    pif_id = pif_doc["id"]
     name = CHAPTER_NAMES[chapter_num]
     st.subheader(f"{NUM_ZH[chapter_num]}、{name}")
 
@@ -1287,10 +1530,18 @@ def render_generic_chapter(db: IngredientDB, pif_id: int, chapter_num: int):
         label_visibility="collapsed",
     )
 
+    if chapter_num in ATTACHMENT_CHAPTERS:
+        st.divider()
+        st.markdown("#### 📎 章節附件")
+        render_chapter_attachments(db, pif_doc, chapter_num)
+        st.divider()
+
     col1, col2 = st.columns([1, 5])
     with col1:
         if st.button(f"💾 儲存第{NUM_ZH[chapter_num]}章", type="primary", key=f"save_ch{chapter_num}"):
-            db.save_chapter_data(pif_id, chapter_num, {"content": content})
+            saved = db.get_chapter_data(pif_id, chapter_num)
+            saved["content"] = content
+            db.save_chapter_data(pif_id, chapter_num, saved)
             st.success(f"第 {chapter_num} 章已儲存！")
             st.rerun()
 
@@ -1497,7 +1748,7 @@ def render_document_list(db: IngredientDB):
             st.warning(f"確定要刪除「{doc['product_name']}」嗎？此操作無法復原。")
             cfm_col1, cfm_col2 = st.columns([1, 5])
             if cfm_col1.button("確認刪除", key=f"cfm_{doc_id}"):
-                db.delete_pif_document(doc_id)
+                _delete_pif_with_files(db, doc)
                 st.session_state.pop(confirm_key, None)
                 st.rerun()
             if cfm_col2.button("取消", key=f"cancel_{doc_id}"):
@@ -1535,6 +1786,7 @@ def main():
     # 返回列表按鈕
     if st.button("← 返回文件列表", key="back_to_list"):
         st.session_state["selected_pif_id"] = None
+        st.session_state.pop(f"confirm_del_pif_{pif_id}", None)
         st.rerun()
 
     with st.expander("✏️ 編輯文件基本資訊", expanded=False):
@@ -1548,7 +1800,20 @@ def main():
             if new_product_name.strip():
                 updates["product_name"] = new_product_name.strip()
             updates["document_number"] = new_doc_num.strip()
+
+            old_dir = pif_upload_dir(db, pif_doc)
             db.update_pif_document(pif_id, updates)
+            new_dir = pif_upload_dir(db, db.get_pif_document(pif_id))
+
+            if new_dir != old_dir and old_dir.exists():
+                if new_dir.exists():  # 目標已存在：逐檔搬入
+                    for src in old_dir.iterdir():
+                        shutil.move(str(src), str(new_dir / src.name))
+                    old_dir.rmdir()
+                else:
+                    new_dir.parent.mkdir(parents=True, exist_ok=True)
+                    old_dir.rename(new_dir)
+                _rewrite_chapter_paths(db, pif_id, old_dir, new_dir)
             st.rerun()
 
     doc_num_display = pif_doc.get("document_number") or "—"
@@ -1563,24 +1828,41 @@ def main():
         st.divider()
 
         chapters = list(CHAPTER_NAMES.keys())
-        # 真正記住目前章節的鍵——普通 session_state 鍵不會被 Streamlit purge
-        if "chapter_current" not in st.session_state:
-            st.session_state["chapter_current"] = 1
-        # 每次 rerun 用記住的章節當 radio 預設值；widget key 若被清掉也能還原
-        st.session_state.setdefault("chapter_selector", st.session_state["chapter_current"])
+        # 目前章節存在 DB（pif_documents.current_chapter）。DB 讀取跟 websocket / session
+        # 狀態無關，每個 run 都必定讀得到，撐得過 AI 解析等長操作造成的重連 / session 重置。
+        _seed = pif_doc.get("current_chapter") or 1
+        if _seed not in chapters:
+            _seed = 1
+
+        def _save_current_chapter():
+            db.set_current_chapter(pif_id, st.session_state["chapter_selector"])
+
+        # 每個 run 開頭先把 widget 值對齊 DB。使用者點選時 on_change 已先把新值寫進 DB，
+        # 故這裡不會蓋掉操作；重連 / session 清空後也能靠 DB 的值強制回到正確章節。
+        st.session_state["chapter_selector"] = _seed
 
         chosen_chapter = st.radio(
             "選擇章節",
             chapters,
             format_func=lambda n: f"{chapter_emoji(statuses.get(n, False))} 第{n}章 {CHAPTER_NAMES[n][:10]}",
             key="chapter_selector",
+            on_change=_save_current_chapter,
         )
-        st.session_state["chapter_current"] = chosen_chapter
 
         st.divider()
-        if st.button("🗑️ 刪除此 PIF", key="del_pif"):
-            db.delete_pif_document(pif_id)
-            st.session_state["selected_pif_id"] = None
+        confirm_del_key = f"confirm_del_pif_{pif_id}"
+        if st.session_state.get(confirm_del_key):
+            st.warning(f"確定要刪除「{pif_doc['product_name']}」嗎？此操作無法復原。")
+            if st.button("✔️ 確認刪除", key="cfm_del_pif", type="primary"):
+                _delete_pif_with_files(db, pif_doc)
+                st.session_state.pop(confirm_del_key, None)
+                st.session_state["selected_pif_id"] = None
+                st.rerun()
+            if st.button("取消", key="cancel_del_pif"):
+                st.session_state.pop(confirm_del_key, None)
+                st.rerun()
+        elif st.button("🗑️ 刪除此 PIF", key="del_pif"):
+            st.session_state[confirm_del_key] = True
             st.rerun()
 
     chapter_num = chosen_chapter
@@ -1588,13 +1870,15 @@ def main():
     if chapter_num == 1:
         render_chapter_1(db, pif_id)
     elif chapter_num == 2:
-        render_chapter_2(db, pif_id)
+        render_chapter_2(db, pif_doc)
     elif chapter_num == 3:
-        render_chapter_3(db, pif_id)
+        render_chapter_3(db, pif_doc)
     elif chapter_num == 10:
         render_chapter_10(db, pif_id)
+    elif chapter_num == 16:
+        render_chapter_16(db, pif_id)
     else:
-        render_generic_chapter(db, pif_id, chapter_num)
+        render_generic_chapter(db, pif_doc, chapter_num)
 
     render_export_panel(db, pif_id, pif_doc)
 

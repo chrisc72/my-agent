@@ -173,15 +173,18 @@ def synthesize_toxicology(inci_name: str, cas_number: str,
                            tw_regulation_text: str,
                            sccs_raw: str, cir_raw: str,
                            tox_doc_text: str = "",
-                           cosing_raw: str = "") -> str:
+                           cosing_raw: str = "",
+                           food_text: str = "") -> str:
     """
-    整合台灣法規 + 上傳毒理文件 + SCCS + CIR 資料，產生毒理安全摘要。
+    整合台灣法規 + 食用安全史 + 上傳毒理文件 + SCCS + CIR 資料，產生毒理安全摘要。
     """
     client = get_client()
 
     context_parts = []
     if tw_regulation_text:
         context_parts.append(f"【台灣衛福部法規】\n{tw_regulation_text}")
+    if food_text:
+        context_parts.append(food_text)
     if tox_doc_text:
         context_parts.append(f"【上傳毒理文件（優先參考）】\n{tox_doc_text}")
     if sccs_raw:
@@ -207,6 +210,9 @@ CAS Number：{cas_number or '未知'}
 
 **台灣法規限制：**
 [從台灣法規資料提取，如無則標示「不在限制名單」]
+
+**食用安全史：**
+[若原料列於台灣「可供食品使用原料一覽表」，說明其分類、可食部位與使用限制，並指出此為證據權重（WoE）之支持論據：具長期歷史食用安全性，經口暴露之系統性風險高於皮膚塗抹。若無此資料則填「無食用安全史資料」]
 
 **EU CosIng 法規狀態：**
 [若有 CosIng 資料，標示 Annex 狀態；若查無限制，填「EU Cosmetics Regulation 查無 Annex 限制，可自由使用，但仍需安全評估佐證」；若無 CosIng 資料則填「無 CosIng 資料」]

@@ -1,9 +1,26 @@
-# Secrets & credentials
+# Secrets & credentials（絕對不能進 git）
 .env
 .env.*
+.env.local
+.env.production
 **/credentials.json
 **/*.key
+**/*.pem
+**/*.p12
 **/.credentials.json
+**/secrets.json
+**/secret.yaml
+**/secret.yml
+config.secret.*
+# API 金鑰文件（.docx 形式，非 .env）
+**/Pif-API Key.docx
+**/*API Key*.docx
+
+# SQLite 資料庫（含使用者資料）
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+pif_tool/data/
 
 # Claude Code 本機狀態（每台電腦各自產生，不該跨機同步）
 .claude/settings.local.json
@@ -19,6 +36,9 @@
 # 工作產出資料（業務資料，不納入版控）
 相關資訊_非系統存取用/
 
+# Obsidian 個人設定（不跨機同步）
+.obsidian/
+
 # 系統檔
 .DS_Store
 Thumbs.db
@@ -31,3 +51,14 @@ node_modules/
 __pycache__/
 playwright-images/
 *.pyc
+
+# Playwright / 瀏覽器自動化暫存快照
+.playwright-mcp/
+page-*.png
+page-*.yml
+
+# 測試截圖（根目錄暫存，非正式資產）
+gantt-01.png
+gantt-after-drag.png
+materials.png
+orders.png
